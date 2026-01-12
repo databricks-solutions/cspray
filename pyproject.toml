@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cspray"
+version = "1.0.3"
+authors = [{name = "Peter Hawkins", email = "peter.hawkins@databricks.com"}]
+description = "Cell SPRAY"
+dependencies = [
+   "anndata>=0.11.3",
+   "scanpy>=1.11.0",
+   "bbknn>=1.5",
+   "pyspark",
+   "pyarrow>=1.14",
+   "numpy<2",
+   "scipy>1.15",
+   "pooch",
+   "pybiomart"
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[tool.setuptools]
+packages = ["cspray"]
+package-dir = {"" = "src"}
