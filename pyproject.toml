@@ -16,7 +16,9 @@ dependencies = [
    "numpy<2",
    "scipy>1.15",
    "pooch",
-   "pybiomart"
+   "pybiomart",
+   "cellxgene_census",
+   "gget"
 ]
 
 [project.optional-dependencies]

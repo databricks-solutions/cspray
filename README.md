@@ -132,6 +132,8 @@ From the root dir, pip install the test environment and run tests:
 | scipy | BSD-3-Clause | https://github.com/scipy/scipy |
 | pooch | BSD-3-Clause | https://github.com/fatiando/pooch |
 | pybiomart | MIT | https://github.com/jrderuiter/pybiomart |
+| gget | BSD-2 | https://github.com/pachterlab/gget |
+| cellxgene-census | MIT | https://github.com/chanzuckerberg/cellxgene-census |
 
 ### additional: Cell Type Annotation
 

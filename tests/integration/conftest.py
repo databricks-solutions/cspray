@@ -4,6 +4,9 @@ import tempfile
 import os
 import shutil
 
+import gget
+import cellxgene_census
+
 import pooch
 import scanpy as sc
 from cspray.data import SprayData
@@ -19,25 +22,30 @@ import numpy as np
 
 @pytest.fixture(scope="module")
 def downloaded_file():
-    EXAMPLE_DATA = pooch.create(
-        path=pooch.os_cache("scverse_tutorials"),
-        base_url="doi:10.6084/m9.figshare.22716739.v1/",
+
+    path = "/tmp/filtered_feature_bc_matrix.h5ad"
+    
+    if os.path.exists(path):
+        os.remove(path)
+
+    gget.setup("cellxgene")
+    
+    cellxgene_census.download_source_h5ad(
+        dataset_id = '0de831e0-a525-4ec5-b717-df56f2de2bf0', 
+        to_path = path, 
+        census_version = "2025-01-30",
+        progress_bar=False,
     )
-    EXAMPLE_DATA.load_registry_from_doi()
-
-    samples = {
-        "s1d1": "s1d1_filtered_feature_bc_matrix.h5",
-    }
-    adatas = {}
-
-    for sample_id, filename in samples.items():
-        path = EXAMPLE_DATA.fetch(filename)
-        sample_adata = sc.read_10x_h5(path)
-        sample_adata.var_names_make_unique()
+    sample_adata = sc.read_h5ad(path)
+    
+    # here we use adata.raw if it exists as is assumeed to be unprocessed raw data
+    if "_raw" in sample_adata.__dict__:
+        if sample_adata._raw is not None:
+            sample_adata = sample_adata.raw.to_adata()
 
     # take small set only for speed of testing
     sample_adata = sample_adata[:500,:]
-
+    
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".h5ad")
     sample_adata.write(temp_file.name)
     
@@ -57,18 +65,11 @@ def scanpy_pp_stage(scanpy_read_stage):
 
     adata = scanpy_read_stage
 
-    adata.obs['int_idx'] = np.arange(len(adata.obs))
-    adata.var['int_idx'] = np.arange(len(adata.var))
-
-    adata.obs_names_make_unique()
-
     gene_col = 'index'
 
-    # here we use adata.raw if it exists as is assumeed to be unprocessed raw data
-
-    if "_raw" in adata.__dict__:
-        if adata._raw is not None:
-            adata = adata.raw.to_adata()
+    # for later testing
+    adata.obs['int_idx'] = np.arange(len(adata.obs))
+    adata.var['int_idx'] = np.arange(len(adata.var))
 
     adata.var = adata.var.reset_index()
     # adata.var['index'] = adata.var['index'].astype(str) 

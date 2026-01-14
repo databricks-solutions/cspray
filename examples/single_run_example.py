@@ -43,22 +43,26 @@ def download_example(file_path):
   print("------------ downloading sample h5ad file -----------")
   import pooch
   import scanpy as sc
+  import requests
 
-  EXAMPLE_DATA = pooch.create(
-      path=pooch.os_cache("scverse_tutorials"),
-      base_url="doi:10.6084/m9.figshare.22716739.v1/",
+  path = "/tmp/filtered_feature_bc_matrix.h5ad"
+  import os
+  if os.path.exists(path):
+    os.remove(path)
+
+  import gget
+  import cellxgene_census
+  gget.setup("cellxgene")
+  
+  cellxgene_census.download_source_h5ad(
+      dataset_id = '0de831e0-a525-4ec5-b717-df56f2de2bf0', 
+      to_path = path, 
+      census_version = "2025-01-30",
+      progress_bar=False,
   )
-  EXAMPLE_DATA.load_registry_from_doi()
 
-  samples = {
-      "s1d1": "s1d1_filtered_feature_bc_matrix.h5",
-  }
-  adatas = {}
-
-  for sample_id, filename in samples.items():
-      path = EXAMPLE_DATA.fetch(filename)
-      sample_adata = sc.read_10x_h5(path)
-      sample_adata.var_names_make_unique()
+  sample_adata = sc.read_h5ad(path)
+  sample_adata.var_names_make_unique()
 
   sample_adata = sample_adata[:1000,:]
 
