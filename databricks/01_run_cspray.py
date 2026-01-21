@@ -1,5 +1,5 @@
 # Databricks notebook source
-# MAGIC %pip install ../../cspray # will become git path in future when public facing
+# MAGIC %pip install git+https://github.com/databricks-solutions/cspray.git@main 
 # MAGIC %restart_python
 
 # COMMAND ----------
