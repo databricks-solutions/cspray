@@ -3,6 +3,9 @@
 __pycache__
 .idea/
 .env
+*.env
+
+databricks/config.yaml
 
 **/.pybiomart.sqlite
 
