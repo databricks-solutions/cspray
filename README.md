@@ -28,10 +28,9 @@
 
 ## Install
 
-Current install method is to clone the repo and pip install via path:
+Install via pip from the git repo (via main branch, or tagged release, with the @ option)
 ```
-~: git clone the/cspray/url
-~: pip install cspray
+~: pip install git+https://github.com/databricks-solutions/cspray.git@main 
 ```
 
 An end to end example for use on a local machine (with at least 12Gb RAM) is included under examples/. This will download a small public dataset, ingest and process that dataset and print some details and final processed tables to terminal. This example will start a spark session for you, but you will need to additionally install java for spark to work if it is not already present in your environment.
