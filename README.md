@@ -113,7 +113,11 @@ From the root dir, pip install the test environment and run tests:
 
 ## License
 
-&copy; 2025 Databricks, Inc. All rights reserved. The source in this notebook is provided subject to the Databricks License [https://databricks.com/db-license-source].  All included or referenced third party libraries are subject to the licenses set forth below.
+&copy; 2025 Databricks, Inc. All rights reserved. This project is dual-licensed under the Databricks License [https://databricks.com/db-license-source] and the Creative Commons Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).
+
+To use this project for commercial purposes, you must comply with the terms of the Databricks License. To use this project for non-commercial purposes you may choose between either license. 
+
+All included or referenced third party libraries are subject to the licenses set forth below.
 
 
 ## Dependencies
