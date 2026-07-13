@@ -207,8 +207,9 @@ def as_gold_mart_data(sdata, cells_per_cluster:int=2000):
 
 # ----- not suggested methods for scanpy soft-distributed code
 # ---- prefer efficient scanpy options
+# -- TESTING REMOVAL - not truly required and removal expected to ease path to serverless deployment
 
-from ._arrow_scanpy_clustering import apply_scanpy_clustering, apply_scanpy_pca_cluster_markers
+# from ._arrow_scanpy_clustering import apply_scanpy_clustering, apply_scanpy_pca_cluster_markers
 # Backward compatibility aliases
-apply_pca_cluster_markers = apply_scanpy_pca_cluster_markers
-apply_clustering = apply_scanpy_clustering
+# apply_pca_cluster_markers = apply_scanpy_pca_cluster_markers
+# apply_clustering = apply_scanpy_clustering
