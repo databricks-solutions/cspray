@@ -159,7 +159,7 @@ def rank_marker_genes(sdata:SprayData, test:str="ttest_ind",base_fdr:float = 0.0
     )
     return None
 
-def as_gold_mart_data(sdata, cells_per_cluster:int=2000):
+def as_gold_mart_data(sdata, cells_per_cluster:int=2000, seed:int=0):
     """
     Only keep a reduced number of cells per cluster and marker genes.
 
@@ -171,6 +171,8 @@ def as_gold_mart_data(sdata, cells_per_cluster:int=2000):
         The SprayData object containing cell and gene data.
     cells_per_cluster : int, optional
         Number of cells to keep per cluster (default: 2000).
+    seed : int, optional
+        Seed for the deterministic per-cluster cell sampling (default: 0).
 
     Returns
     -------
@@ -183,13 +185,18 @@ def as_gold_mart_data(sdata, cells_per_cluster:int=2000):
         on=['file_path','gene_name'],
         how='inner'
     )
-    
-    window = Window.partitionBy('fp_int', 'cluster_id').orderBy(F.rand())
+
+    # Deterministic per-cluster subsample: ordering is a pure function of
+    # (fp_int, cell_idx, seed), so the sdata.X join below selects the identical
+    # cell set on recompute without needing .cache() (serverless-compatible).
+    window = Window.partitionBy('fp_int', 'cluster_id').orderBy(
+        F.hash('fp_int', 'cell_idx', F.lit(seed))
+    )
     sdata.obs = sdata.obs.withColumn(
         'row_num', F.row_number().over(window)
     ).filter(
         F.col('row_num') <= cells_per_cluster
-    ).drop('row_num').cache()
+    ).drop('row_num')
 
 
     # changed order to do cells first in case lose some cells
