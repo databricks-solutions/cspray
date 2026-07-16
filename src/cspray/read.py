@@ -53,6 +53,112 @@ cellstruct = T.StructType([
 ])
 
 
+def _gene_pa_schema(include_meta: bool = False):
+    """Arrow schema for the var (gene) mapper, optionally with a JSON metadata field."""
+    fields = [
+        ('fp_int', pa.int32()),
+        ('gene_idx', pa.int64()),
+        ('gene_id', pa.string()),
+        ('gene_name', pa.string()),
+    ]
+    if include_meta:
+        fields.append(('var_json', pa.string()))
+    return pa.schema(fields)
+
+
+def _gene_spark_schema(include_meta: bool = False):
+    """Spark schema for the var (gene) mapper, optionally with a JSON metadata field."""
+    fields = [
+        T.StructField("fp_int", T.IntegerType(), False),
+        T.StructField("gene_idx", T.LongType(), False),
+        T.StructField("gene_id", T.StringType(), False),
+        T.StructField("gene_name", T.StringType(), False),
+    ]
+    if include_meta:
+        fields.append(T.StructField("var_json", T.StringType(), True))
+    return T.StructType(fields)
+
+
+def _cell_pa_schema(include_meta: bool = False):
+    """Arrow schema for the obs (cell) mapper, optionally with a JSON metadata field."""
+    fields = [
+        ('fp_int', pa.int32()),
+        ('cell_idx', pa.int64()),
+        ('cell_barcode', pa.string()),
+    ]
+    if include_meta:
+        fields.append(('obs_json', pa.string()))
+    return pa.schema(fields)
+
+
+def _cell_spark_schema(include_meta: bool = False):
+    """Spark schema for the obs (cell) mapper, optionally with a JSON metadata field."""
+    fields = [
+        T.StructField("fp_int", T.IntegerType(), False),
+        T.StructField("cell_idx", T.LongType(), False),
+        T.StructField("cell_barcode", T.StringType(), False),
+    ]
+    if include_meta:
+        fields.append(T.StructField("obs_json", T.StringType(), True))
+    return T.StructType(fields)
+
+
+def _resolve_wanted_keys(index_key, metadata_columns, always_keep=None):
+    """Resolve which h5ad group columns to extract for a given metadata request.
+
+    Parameters
+    ----------
+    index_key : str
+        The group's `_index` column (cell barcode / gene id), always required.
+    metadata_columns : None | 'all' | list[str]
+        None  -> only the index (+ always_keep): today's behaviour, no metadata.
+        'all' -> every column in the group (returns None to signal "all").
+        list  -> the index (+ always_keep) plus the requested columns.
+    always_keep : list[str], optional
+        Extra columns that must be read regardless (e.g. the gene name column).
+
+    Returns
+    -------
+    list[str] | None
+        Ordered, de-duplicated list of keys to read, or None to read all.
+    """
+    if metadata_columns == 'all':
+        return None
+    wanted = [index_key]
+    if always_keep:
+        wanted += [c for c in always_keep if c is not None]
+    if metadata_columns is not None:
+        wanted += list(metadata_columns)
+    # de-duplicate while preserving order
+    return list(dict.fromkeys(wanted))
+
+
+def _rows_to_json(df: pd.DataFrame, double_precision: int = 15):
+    """Serialize each row of a DataFrame to a JSON string (one string per row).
+
+    Uses pandas' JSON writer so categoricals, NaN -> null and numpy scalar
+    types are handled correctly. `double_precision=15` avoids silently
+    truncating float64 values. Columns are expected to be 1-D and aligned to
+    the frame length.
+    """
+    n = len(df)
+    if df.shape[1] == 0:
+        return ['{}'] * n
+    # categoricals -> plain python objects so the values (not integer codes) serialize
+    safe = df.copy()
+    for c in safe.columns:
+        if isinstance(safe[c].dtype, pd.CategoricalDtype):
+            safe[c] = safe[c].astype(object)
+    json_lines = safe.to_json(orient='records', lines=True, double_precision=double_precision)
+    if json_lines == '':
+        return ['{}'] * n
+    parts = json_lines.split('\n')
+    # some pandas versions emit a trailing newline
+    if len(parts) == n + 1 and parts[-1] == '':
+        parts = parts[:-1]
+    return parts
+
+
 
 def default_read_fn(spark, name: str):
     return spark.table(name)
@@ -275,7 +381,9 @@ def h5_group_pdf_to_dict(group, limit : int = None, keys : Optional[List[str]] =
     if keys is None:
         keys = list(group.keys())
 
-    for key in group.keys():
+    for key in keys:
+        if key not in group:
+            continue
         try:
             data_dict[key] = process_type(group[key], limit=limit)
         except:
@@ -292,7 +400,7 @@ def h5_group_pdf_to_dict(group, limit : int = None, keys : Optional[List[str]] =
     return data_dict
 
 
-def mapinarrow_var_from_h5ad(itr: Iterator, gene_name_column:Optional[str]=None, from_raw:bool=True, fallback_default:bool=False):
+def mapinarrow_var_from_h5ad(itr: Iterator, gene_name_column:Optional[str]=None, from_raw:bool=True, fallback_default:bool=False, metadata_columns:Optional[Union[str,List[str]]]=None):
     """
     Extracts gene metadata from h5ad files as Arrow RecordBatches.
 
@@ -306,70 +414,60 @@ def mapinarrow_var_from_h5ad(itr: Iterator, gene_name_column:Optional[str]=None,
         If True, attempts to read from the 'raw' group in the h5ad file.
     fallback_default : bool, optional
         If True and 'raw' group is missing, falls back to the default group.
+    metadata_columns : 'all' or list[str], optional
+        If provided, the remaining var columns are serialized per-gene into a
+        JSON string field (`var_json`). 'all' captures every column; a list
+        captures the named columns (missing ones are simply skipped per file).
+        If None (default), no metadata is captured (original behaviour).
 
     Yields
     ------
     pa.RecordBatch
-        Arrow RecordBatch containing fp_int, gene_idx, gene_id, and gene_name for each gene in the file.
+        Arrow RecordBatch containing fp_int, gene_idx, gene_id, gene_name, and
+        (when metadata_columns is set) a var_json string per gene.
     """
-    # def mapinarrow_var_from_h5ad(itr: Iterator):
+    include_meta = metadata_columns is not None
     for batch in itr:
         d = batch.to_pydict()
         for file_path,fp_int in zip(d['file_path'], d['fp_int']):
             file = h5py.File(file_path, 'r')
-            
-            # parse var from h5 to dict
-            tmp_dict = None
-            if from_raw:       
-                if 'raw' in file:
-                    tmp_dict = h5_group_pdf_to_dict(file['raw']['var']) 
-                    col_map = {file['raw']['var'].attrs['_index']:'gene_index'}
-                else:
-                    if fallback_default:
-                        tmp_dict = h5_group_pdf_to_dict(file['var']) 
-                        col_map = {file['var'].attrs['_index']:'gene_index'}
-                    else:
-                        raise Exception("No raw data found in h5ad file. Please set fallback_default=True to use the default data instead. Or ensure your h5ad files all have raw if using raw")
-            else:
-                    tmp_dict = h5_group_pdf_to_dict(file['var'])
-                    col_map = {file['var'].attrs['_index']:'gene_index'}
-            
-            # convert to df
-            tmp_df = pd.DataFrame(tmp_dict)
-            tmp_df = tmp_df.rename(columns=col_map)
 
-            # identify the Ensembl_id column
-            # col_map = None
-            # for c in tmp_df.columns:
-            #     if tmp_df[c].head(200).astype(str).str.startswith('ENSG').mean()>0.2:
-            #         if c != 'gene_index':
-            #             col_map = {c:'gene_index'}
-            # if col_map is not None:
-            #     tmp_df = tmp_df.rename(columns=col_map)
-            
-            
-            # extract only ensembl_ids and gene_names (really only need the ensembl as later will use together with a consistent mapping)
-            if gene_name_column is not None:
-                tmp_df = tmp_df[['gene_index',gene_name_column]]
+            # choose the var group (raw vs default)
+            if from_raw:
+                if 'raw' in file:
+                    group = file['raw']['var']
+                elif fallback_default:
+                    group = file['var']
+                else:
+                    raise Exception("No raw data found in h5ad file. Please set fallback_default=True to use the default data instead. Or ensure your h5ad files all have raw if using raw")
             else:
-                tmp_df = tmp_df[['gene_index']]
-            
-            ensembl_ids = tmp_df['gene_index'].values
-            
+                group = file['var']
+
+            index_key = group.attrs['_index']
+
+            wanted = _resolve_wanted_keys(index_key, metadata_columns, always_keep=[gene_name_column])
+            tmp_dict = h5_group_pdf_to_dict(group, keys=wanted)
+            tmp_df = pd.DataFrame(tmp_dict)
+
+            n = len(tmp_df)
+            ensembl_ids = tmp_df[index_key].values
             if gene_name_column is not None:
                 gene_names = tmp_df[gene_name_column].values
             else:
-                gene_names = tmp_df['gene_index'].values
+                gene_names = ensembl_ids
             logging.info(tmp_df.head())
-            # ensemble_ids = np.char.decode(file['raw']['var']['feature_id'][:].astype('S'))
-            # gene_names = np.char.decode(file['raw']['var']['feature_names'][:].astype('S'))
-            yield pa.RecordBatch.from_pydict({
-                'fp_int': [fp_int]*len(ensembl_ids),
-                'gene_idx' : np.arange(len(ensembl_ids)),
+
+            record = {
+                'fp_int': [fp_int]*n,
+                'gene_idx': np.arange(n),
                 'gene_id': ensembl_ids,
                 'gene_name': gene_names,
-            }, schema=pa_gene_schema)
-        # return internal_var_from_h5ad
+            }
+            if include_meta:
+                meta_df = tmp_df.drop(columns=[index_key])
+                record['var_json'] = _rows_to_json(meta_df)
+
+            yield pa.RecordBatch.from_pydict(record, schema=_gene_pa_schema(include_meta))
 
 def construct_h5ad_path_df(
     path:Optional[Union[List,str]]=None, 
@@ -496,6 +594,8 @@ def read_var_from_h5ads(
     from_raw:bool=True,
     fallback_default:bool=False,
     force_partitioning: Optional[int]=None,
+    metadata_columns:Optional[Union[str,List[str]]]=None,
+    metadata_variant:bool=True,
     ):
     """
     Reads gene metadata from one or more h5ad files into a Spark DataFrame.
@@ -516,11 +616,21 @@ def read_var_from_h5ads(
         If True and 'raw' group is missing, falls back to the default group.
     force_partitioning : int, optional
         If provided, repartitions the DataFrame to the specified number of partitions.
+    metadata_columns : 'all' or list[str], optional
+        If provided, the remaining var columns are captured into a `var_data`
+        metadata column (see metadata_variant). None (default) keeps the
+        original behaviour of only extracting gene_id / gene_name.
+    metadata_variant : bool, optional
+        If True (default) the captured metadata is parsed into a VARIANT column
+        (`parse_json`, requires Spark 3.5+/DBR 15.3+). If False the metadata is
+        left as a JSON string column (portable to OSS Spark). Only relevant when
+        metadata_columns is set.
 
     Returns
     -------
     pyspark.sql.DataFrame
-        DataFrame containing gene metadata with columns: file_path, fp_int, gene_idx, gene_id, gene_name.
+        DataFrame containing gene metadata with columns: file_path, fp_int,
+        gene_idx, gene_id, gene_name, and (when metadata_columns is set) var_data.
     """
     df = construct_h5ad_path_df(path,df,spark)
     
@@ -530,20 +640,26 @@ def read_var_from_h5ads(
     if force_partitioning:
         df = df.repartition(force_partitioning)
 
+    include_meta = metadata_columns is not None
     sdf = df.select('file_path','fp_int')\
         .mapInArrow(
-            lambda x: mapinarrow_var_from_h5ad(x, gene_name_column=gene_name_column, from_raw=from_raw, fallback_default=fallback_default), #(gene_name_column),
-            schema=genestruct
+            lambda x: mapinarrow_var_from_h5ad(x, gene_name_column=gene_name_column, from_raw=from_raw, fallback_default=fallback_default, metadata_columns=metadata_columns),
+            schema=_gene_spark_schema(include_meta)
         )
 
     sdf = sdf.join(
         df,
         how='left',
         on='fp_int'
-    )  
+    )
+    if include_meta:
+        if metadata_variant:
+            sdf = sdf.withColumn('var_data', F.expr('parse_json(var_json)')).drop('var_json')
+        else:
+            sdf = sdf.withColumnRenamed('var_json', 'var_data')
     return sdf
 
-def mapinarrow_obs_from_h5ad(itr: Iterator):
+def mapinarrow_obs_from_h5ad(itr: Iterator, metadata_columns:Optional[Union[str,List[str]]]=None):
     """
     Extracts cell metadata from h5ad files as Arrow RecordBatches.
 
@@ -551,34 +667,43 @@ def mapinarrow_obs_from_h5ad(itr: Iterator):
     ----------
     itr : Iterator
         Iterator over batches containing file paths and file integer identifiers.
-    gene_name_column : str, optional
-        Name of the column to use for gene names. If None, only gene IDs are extracted.
+    metadata_columns : 'all' or list[str], optional
+        If provided, the remaining obs columns are serialized per-cell into a
+        JSON string field (`obs_json`). 'all' captures every column; a list
+        captures the named columns (missing ones are simply skipped per file).
+        If None (default), no metadata is captured (original behaviour).
 
     Yields
     ------
     pa.RecordBatch
-        Arrow RecordBatch containing fp_int, gene_idx, gene_id, and gene_name for each gene in the file.
+        Arrow RecordBatch containing fp_int, cell_idx, cell_barcode, and
+        (when metadata_columns is set) an obs_json string per cell.
     """
-    # def mapinarrow_var_from_h5ad(itr: Iterator):
+    include_meta = metadata_columns is not None
     for batch in itr:
         d = batch.to_pydict()
         for file_path,fp_int in zip(d['file_path'], d['fp_int']):
             file = h5py.File(file_path, 'r')
-            
-            # parse obs from h5 to dict
-            tmp_dict = h5_group_pdf_to_dict(file['obs'], keys = [file['obs'].attrs['_index']]) 
-            # convert to df
+
+            index_key = file['obs'].attrs['_index']
+
+            wanted = _resolve_wanted_keys(index_key, metadata_columns)
+            tmp_dict = h5_group_pdf_to_dict(file['obs'], keys=wanted)
             tmp_df = pd.DataFrame(tmp_dict)
 
-            tmp_df = tmp_df.rename(columns={file['obs'].attrs['_index']:'cell_barcode'})
-            
+            n = len(tmp_df)
             logging.info(tmp_df.head())
-            
-            yield pa.RecordBatch.from_pydict({
-                'fp_int': [fp_int]*len(tmp_df),
-                'cell_idx' : np.arange(len(tmp_df)),
-                'cell_barcode': tmp_df['cell_barcode'],
-            }, schema=pa_cell_schema)
+
+            record = {
+                'fp_int': [fp_int]*n,
+                'cell_idx': np.arange(n),
+                'cell_barcode': tmp_df[index_key].values,
+            }
+            if include_meta:
+                meta_df = tmp_df.drop(columns=[index_key])
+                record['obs_json'] = _rows_to_json(meta_df)
+
+            yield pa.RecordBatch.from_pydict(record, schema=_cell_pa_schema(include_meta))
 
 def read_obs_from_h5ads(
     spark:pyspark.sql.session.SparkSession,
@@ -587,9 +712,11 @@ def read_obs_from_h5ads(
     from_raw:bool=True,
     fallback_default:bool=False,
     force_partitioning: Optional[int]=None,
+    metadata_columns:Optional[Union[str,List[str]]]=None,
+    metadata_variant:bool=True,
     ):
     """
-    Reads gene metadata from one or more h5ad files into a Spark DataFrame.
+    Reads cell metadata from one or more h5ad files into a Spark DataFrame.
 
     Parameters
     ----------
@@ -599,19 +726,27 @@ def read_obs_from_h5ads(
         Directory containing h5ad files, a single h5ad file path, or a list of h5ad file paths.
     df : pyspark.sql.DataFrame, optional
         Existing DataFrame containing file paths. If provided, 'path' must be None.
-    gene_name_column : str, optional
-        Name of the column to use for gene names. If None, only gene IDs are extracted.
     from_raw : bool, optional
         If True, reads gene metadata from the 'raw' group in the h5ad file.
     fallback_default : bool, optional
         If True and 'raw' group is missing, falls back to the default group.
     force_partitioning : int, optional
         If provided, repartitions the DataFrame to the specified number of partitions.
+    metadata_columns : 'all' or list[str], optional
+        If provided, the remaining obs columns are captured into an `obs_data`
+        metadata column (see metadata_variant). None (default) keeps the
+        original behaviour of only extracting the cell barcode.
+    metadata_variant : bool, optional
+        If True (default) the captured metadata is parsed into a VARIANT column
+        (`parse_json`, requires Spark 3.5+/DBR 15.3+). If False the metadata is
+        left as a JSON string column (portable to OSS Spark). Only relevant when
+        metadata_columns is set.
 
     Returns
     -------
     pyspark.sql.DataFrame
-        DataFrame containing gene metadata with columns: file_path, fp_int, gene_idx, gene_id, gene_name.
+        DataFrame containing cell metadata with columns: file_path, fp_int,
+        cell_idx, cell_barcode, and (when metadata_columns is set) obs_data.
     """
     df = construct_h5ad_path_df(path,df,spark)
     
@@ -621,15 +756,21 @@ def read_obs_from_h5ads(
     if force_partitioning:
         df = df.repartition(force_partitioning)
 
+    include_meta = metadata_columns is not None
     sdf = df.select('file_path','fp_int')\
         .mapInArrow(
-            lambda x: mapinarrow_obs_from_h5ad(x),
-            schema=cellstruct
+            lambda x: mapinarrow_obs_from_h5ad(x, metadata_columns=metadata_columns),
+            schema=_cell_spark_schema(include_meta)
         )
 
     sdf = sdf.join(
         df,
         how='left',
         on='fp_int'
-    )  
+    )
+    if include_meta:
+        if metadata_variant:
+            sdf = sdf.withColumn('obs_data', F.expr('parse_json(obs_json)')).drop('obs_json')
+        else:
+            sdf = sdf.withColumnRenamed('obs_json', 'obs_data')
     return sdf
