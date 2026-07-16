@@ -144,12 +144,10 @@ def _rows_to_json(df: pd.DataFrame, double_precision: int = 15):
     n = len(df)
     if df.shape[1] == 0:
         return ['{}'] * n
-    # categoricals -> plain python objects so the values (not integer codes) serialize
-    safe = df.copy()
-    for c in safe.columns:
-        if isinstance(safe[c].dtype, pd.CategoricalDtype):
-            safe[c] = safe[c].astype(object)
-    json_lines = safe.to_json(orient='records', lines=True, double_precision=double_precision)
+    # pandas' to_json serializes category dtype as its values (not codes) and
+    # maps NaN -> null, so we avoid an explicit astype(object)/copy here: on wide
+    # heavily-categorical obs that copy+expansion is the dominant memory cost.
+    json_lines = df.to_json(orient='records', lines=True, double_precision=double_precision)
     if json_lines == '':
         return ['{}'] * n
     parts = json_lines.split('\n')
@@ -191,6 +189,53 @@ def udf_get_raw_maxsize(path):
         return 0
     size = file['raw']['X']['data'].shape[0]
     return size
+
+@F.udf(returnType=T.LongType())
+def udf_get_n_obs(path):
+    """Number of cells (obs rows). Reads only the index dataset shape, no data."""
+    file = h5py.File(path, 'r')
+    group = file['obs']
+    return int(group[group.attrs['_index']].shape[0])
+
+def make_n_var_udf(from_raw: bool, fallback_default: bool):
+    """Factory for a UDF returning the number of genes (var rows).
+
+    The var group depends on the raw/default selection, so the flags are baked
+    into the closure. Returns -1 when raw is required but missing and no fallback
+    is allowed (matching the mapper's error condition).
+    """
+    @F.udf(returnType=T.LongType())
+    def _udf_get_n_var(path):
+        file = h5py.File(path, 'r')
+        if from_raw:
+            if 'raw' in file:
+                group = file['raw']['var']
+            elif fallback_default:
+                group = file['var']
+            else:
+                return -1
+        else:
+            group = file['var']
+        return int(group[group.attrs['_index']].shape[0])
+    return _udf_get_n_var
+
+def _explode_row_ranges(sdf, count_col: str, chunk_size: Optional[int], force_partitioning: Optional[int]):
+    """Explode a per-file row count into (start_idx, end_idx) chunk ranges.
+
+    Mirrors the expression-chunking pattern but on the row axis (cells/genes).
+    end_idx is exclusive. When chunk_size is falsy a single whole-file range is
+    produced (start_idx=0, end_idx=count). Optionally repartitions the exploded
+    ranges so chunks of large files parallelize across tasks.
+    """
+    if chunk_size:
+        sdf = sdf.withColumn('starts', F.sequence(F.lit(0), F.col(count_col) - 1, F.lit(chunk_size)))
+        sdf = sdf.withColumn('start_idx', F.explode('starts')).drop('starts')
+        sdf = sdf.withColumn('end_idx', F.least(F.col(count_col), F.col('start_idx') + F.lit(chunk_size)))
+    else:
+        sdf = sdf.withColumn('start_idx', F.lit(0)).withColumn('end_idx', F.col(count_col))
+    if force_partitioning:
+        sdf = sdf.withColumn('id', F.monotonically_increasing_id()).repartition(force_partitioning)
+    return sdf
 
 def coo_subarr_to_arrmap(coo_chunk):
     arr_out = [{
@@ -333,34 +378,35 @@ def mapinarrow_process_float_expression_h5ad(itr: Iterator, from_raw:bool=True, 
                 'expression': coo_chunk.data
             }, schema=pa_int_schema)
 
-def process_type(v, limit : int =None):
+def process_type(v, start : int = 0, end : Optional[int] = None):
     """
     Processes an H5AD dataset or array-like object, returning its contents as a NumPy array or string array.
+
+    Only the row range ``[start:end)`` is read from the (possibly disk-backed)
+    dataset, so callers can stream large columns in slices without materializing
+    the whole thing.
 
     Parameters
     ----------
     v : h5py.Dataset or array-like
         The dataset or array to process.
-    limit : int, optional
-        If provided, limits the number of elements returned.
+    start : int, optional
+        Inclusive start row of the slice to read. Defaults to 0.
+    end : int, optional
+        Exclusive end row of the slice to read. Defaults to None (read to the end).
 
     Returns
     -------
     np.ndarray or np.chararray
-        The processed array, either as a string array (if dtype is 'S' or 'O') or as a regular NumPy array.
+        The processed slice, either as a string array (if dtype is 'S' or 'O') or as a regular NumPy array.
     """
-    if limit is None:
-        if v.dtype.kind in ['S','O']:
-            return v.asstr()[:]   
-        else:
-            return v[:]
+    sl = slice(start, end)
+    if v.dtype.kind in ['S','O']:
+        return v.asstr()[sl]
     else:
-        if v.dtype.kind in ['S','O']:
-            return v.asstr()[:limit]   
-        else:
-            return v[:limit]
+        return v[sl]
     
-def h5_group_pdf_to_dict(group, limit : int = None, keys : Optional[List[str]] = None):
+def h5_group_pdf_to_dict(group, keys : Optional[List[str]] = None, start : int = 0, end : Optional[int] = None):
     """
     Converts an H5AD group to a dictionary of arrays or Series. Useful for dataframe type extraction.
 
@@ -368,8 +414,15 @@ def h5_group_pdf_to_dict(group, limit : int = None, keys : Optional[List[str]] =
     ----------
     group : h5py.Group
         The HDF5(h5ad) group to convert.
-    limit : int, optional
-        If provided, limits the number of elements returned for each key.
+    keys : list[str], optional
+        If provided, only these keys are read (column pushdown). Keys not present
+        in the group are skipped. Defaults to all keys in the group.
+    start : int, optional
+        Inclusive start row of the slice to read for each column. Defaults to 0.
+    end : int, optional
+        Exclusive end row of the slice to read for each column. Defaults to None
+        (read to the end). For categoricals only the codes are sliced; the
+        (small) categories list is always read in full.
 
     Returns
     -------
@@ -385,16 +438,13 @@ def h5_group_pdf_to_dict(group, limit : int = None, keys : Optional[List[str]] =
         if key not in group:
             continue
         try:
-            data_dict[key] = process_type(group[key], limit=limit)
+            data_dict[key] = process_type(group[key], start=start, end=end)
         except:
             try:
                 data_dict[key] = pd.Series(pd.Categorical.from_codes(
-                    process_type(group[key]['codes']),
+                    process_type(group[key]['codes'], start=start, end=end),
                     process_type(group[key]['categories'])
                 ))
-                if limit is not None:
-
-                    data_dict[key] = data_dict[key].head(limit)
             except Exception as e:
                 logging.warn(f"key: {key}, does not behave according to expected rules. Error: {e}")
     return data_dict
@@ -420,6 +470,12 @@ def mapinarrow_var_from_h5ad(itr: Iterator, gene_name_column:Optional[str]=None,
         captures the named columns (missing ones are simply skipped per file).
         If None (default), no metadata is captured (original behaviour).
 
+    Notes
+    -----
+    Each input row carries a (start_idx, end_idx) gene range; only that slice of
+    the var group is read, and gene_idx is emitted as a global index
+    (start_idx + local offset) so it stays aligned with the expression matrix.
+
     Yields
     ------
     pa.RecordBatch
@@ -429,7 +485,7 @@ def mapinarrow_var_from_h5ad(itr: Iterator, gene_name_column:Optional[str]=None,
     include_meta = metadata_columns is not None
     for batch in itr:
         d = batch.to_pydict()
-        for file_path,fp_int in zip(d['file_path'], d['fp_int']):
+        for file_path,fp_int,start_idx,end_idx in zip(d['file_path'], d['fp_int'], d['start_idx'], d['end_idx']):
             file = h5py.File(file_path, 'r')
 
             # choose the var group (raw vs default)
@@ -446,7 +502,7 @@ def mapinarrow_var_from_h5ad(itr: Iterator, gene_name_column:Optional[str]=None,
             index_key = group.attrs['_index']
 
             wanted = _resolve_wanted_keys(index_key, metadata_columns, always_keep=[gene_name_column])
-            tmp_dict = h5_group_pdf_to_dict(group, keys=wanted)
+            tmp_dict = h5_group_pdf_to_dict(group, keys=wanted, start=start_idx, end=end_idx)
             tmp_df = pd.DataFrame(tmp_dict)
 
             n = len(tmp_df)
@@ -459,7 +515,7 @@ def mapinarrow_var_from_h5ad(itr: Iterator, gene_name_column:Optional[str]=None,
 
             record = {
                 'fp_int': [fp_int]*n,
-                'gene_idx': np.arange(n),
+                'gene_idx': np.arange(start_idx, start_idx + n),
                 'gene_id': ensembl_ids,
                 'gene_name': gene_names,
             }
@@ -596,6 +652,7 @@ def read_var_from_h5ads(
     force_partitioning: Optional[int]=None,
     metadata_columns:Optional[Union[str,List[str]]]=None,
     metadata_variant:bool=True,
+    metadata_chunk_size:Optional[int]=None,
     ):
     """
     Reads gene metadata from one or more h5ad files into a Spark DataFrame.
@@ -615,7 +672,7 @@ def read_var_from_h5ads(
     fallback_default : bool, optional
         If True and 'raw' group is missing, falls back to the default group.
     force_partitioning : int, optional
-        If provided, repartitions the DataFrame to the specified number of partitions.
+        If provided, repartitions the exploded gene-range chunks to the specified number of partitions.
     metadata_columns : 'all' or list[str], optional
         If provided, the remaining var columns are captured into a `var_data`
         metadata column (see metadata_variant). None (default) keeps the
@@ -625,6 +682,9 @@ def read_var_from_h5ads(
         (`parse_json`, requires Spark 3.5+/DBR 15.3+). If False the metadata is
         left as a JSON string column (portable to OSS Spark). Only relevant when
         metadata_columns is set.
+    metadata_chunk_size : int, optional
+        Number of genes (var rows) to read per chunk. Bounds per-worker memory
+        independent of file size. None (default) reads each file whole.
 
     Returns
     -------
@@ -637,11 +697,12 @@ def read_var_from_h5ads(
     df = df.select('file_path').distinct()
     df = df.withColumn('fp_int', F.hash('file_path'))
 
-    if force_partitioning:
-        df = df.repartition(force_partitioning)
+    # explode each file into (start_idx, end_idx) gene ranges (whole-file when chunk size unset)
+    ranged = df.withColumn('n_var', make_n_var_udf(from_raw, fallback_default)(F.col('file_path')))
+    ranged = _explode_row_ranges(ranged, 'n_var', metadata_chunk_size, force_partitioning)
 
     include_meta = metadata_columns is not None
-    sdf = df.select('file_path','fp_int')\
+    sdf = ranged.select('file_path','fp_int','start_idx','end_idx')\
         .mapInArrow(
             lambda x: mapinarrow_var_from_h5ad(x, gene_name_column=gene_name_column, from_raw=from_raw, fallback_default=fallback_default, metadata_columns=metadata_columns),
             schema=_gene_spark_schema(include_meta)
@@ -673,6 +734,12 @@ def mapinarrow_obs_from_h5ad(itr: Iterator, metadata_columns:Optional[Union[str,
         captures the named columns (missing ones are simply skipped per file).
         If None (default), no metadata is captured (original behaviour).
 
+    Notes
+    -----
+    Each input row carries a (start_idx, end_idx) cell range; only that slice of
+    the obs group is read, and cell_idx is emitted as a global index
+    (start_idx + local offset) so it stays aligned with the expression matrix.
+
     Yields
     ------
     pa.RecordBatch
@@ -682,13 +749,13 @@ def mapinarrow_obs_from_h5ad(itr: Iterator, metadata_columns:Optional[Union[str,
     include_meta = metadata_columns is not None
     for batch in itr:
         d = batch.to_pydict()
-        for file_path,fp_int in zip(d['file_path'], d['fp_int']):
+        for file_path,fp_int,start_idx,end_idx in zip(d['file_path'], d['fp_int'], d['start_idx'], d['end_idx']):
             file = h5py.File(file_path, 'r')
 
             index_key = file['obs'].attrs['_index']
 
             wanted = _resolve_wanted_keys(index_key, metadata_columns)
-            tmp_dict = h5_group_pdf_to_dict(file['obs'], keys=wanted)
+            tmp_dict = h5_group_pdf_to_dict(file['obs'], keys=wanted, start=start_idx, end=end_idx)
             tmp_df = pd.DataFrame(tmp_dict)
 
             n = len(tmp_df)
@@ -696,7 +763,7 @@ def mapinarrow_obs_from_h5ad(itr: Iterator, metadata_columns:Optional[Union[str,
 
             record = {
                 'fp_int': [fp_int]*n,
-                'cell_idx': np.arange(n),
+                'cell_idx': np.arange(start_idx, start_idx + n),
                 'cell_barcode': tmp_df[index_key].values,
             }
             if include_meta:
@@ -714,6 +781,7 @@ def read_obs_from_h5ads(
     force_partitioning: Optional[int]=None,
     metadata_columns:Optional[Union[str,List[str]]]=None,
     metadata_variant:bool=True,
+    metadata_chunk_size:Optional[int]=None,
     ):
     """
     Reads cell metadata from one or more h5ad files into a Spark DataFrame.
@@ -731,7 +799,7 @@ def read_obs_from_h5ads(
     fallback_default : bool, optional
         If True and 'raw' group is missing, falls back to the default group.
     force_partitioning : int, optional
-        If provided, repartitions the DataFrame to the specified number of partitions.
+        If provided, repartitions the exploded cell-range chunks to the specified number of partitions.
     metadata_columns : 'all' or list[str], optional
         If provided, the remaining obs columns are captured into an `obs_data`
         metadata column (see metadata_variant). None (default) keeps the
@@ -741,6 +809,9 @@ def read_obs_from_h5ads(
         (`parse_json`, requires Spark 3.5+/DBR 15.3+). If False the metadata is
         left as a JSON string column (portable to OSS Spark). Only relevant when
         metadata_columns is set.
+    metadata_chunk_size : int, optional
+        Number of cells (obs rows) to read per chunk. Bounds per-worker memory
+        independent of file size. None (default) reads each file whole.
 
     Returns
     -------
@@ -753,11 +824,12 @@ def read_obs_from_h5ads(
     df = df.select('file_path').distinct()
     df = df.withColumn('fp_int', F.hash('file_path'))
 
-    if force_partitioning:
-        df = df.repartition(force_partitioning)
+    # explode each file into (start_idx, end_idx) cell ranges (whole-file when chunk size unset)
+    ranged = df.withColumn('n_obs', udf_get_n_obs(F.col('file_path')))
+    ranged = _explode_row_ranges(ranged, 'n_obs', metadata_chunk_size, force_partitioning)
 
     include_meta = metadata_columns is not None
-    sdf = df.select('file_path','fp_int')\
+    sdf = ranged.select('file_path','fp_int','start_idx','end_idx')\
         .mapInArrow(
             lambda x: mapinarrow_obs_from_h5ad(x, metadata_columns=metadata_columns),
             schema=_cell_spark_schema(include_meta)

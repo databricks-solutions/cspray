@@ -1,7 +1,10 @@
 import os
+import json
 from scipy.sparse import coo_matrix
 from scipy import stats
 import numpy as np
+
+from cspray.data import SprayData
 
 # to be placed in SprayData later as part of to_anndata method
 def sdata_to_csr(sdata, expression_col = 'expression'):
@@ -40,6 +43,47 @@ def test_cspray_scanpy_shape_match(cspray_read_stage, scanpy_read_stage):
     adata = scanpy_read_stage
     
     assert (sdata.obs.count(), sdata.var.count()) == tuple(adata.X.shape)
+
+def test_cspray_metadata_chunked(downloaded_file, spark_collect, scanpy_read_stage):
+    """Read obs/var metadata with a small chunk size (forcing multiple chunks per
+    file) and confirm chunking preserves counts, produces contiguous global
+    indices, and round-trips the metadata payload.
+
+    Uses metadata_variant=False (JSON string) so it is portable to OSS Spark,
+    which lacks the VARIANT type / parse_json.
+    """
+    adata = scanpy_read_stage
+    n_cells, n_genes = adata.X.shape
+
+    sdata = SprayData.from_h5ads(
+        spark_collect,
+        path=downloaded_file,
+        force_partitioning=4,
+        from_raw=False,
+        mode='delta',
+        obs_metadata_columns='all',
+        var_metadata_columns='all',
+        metadata_variant=False,      # JSON string column: portable to OSS Spark
+        metadata_chunk_size=100,     # << n_cells/n_genes so the file splits into many chunks
+    )
+
+    # metadata columns are present
+    assert 'obs_data' in sdata.obs.columns
+    assert 'var_data' in sdata.var.columns
+
+    # chunking preserved every cell with a contiguous, unique global cell_idx
+    cell_idx = sdata.obs.select('cell_idx').toPandas()['cell_idx'].values
+    assert len(cell_idx) == n_cells
+    assert set(cell_idx) == set(range(n_cells))
+
+    # ... and every gene with a contiguous, unique global gene_idx
+    gene_idx = sdata.var.select('gene_idx').toPandas()['gene_idx'].values
+    assert len(gene_idx) == n_genes
+    assert set(gene_idx) == set(range(n_genes))
+
+    # metadata payload round-trips to a JSON object per row
+    sample = sdata.obs.select('obs_data').limit(1).toPandas()['obs_data'].iloc[0]
+    assert isinstance(json.loads(sample), dict)
 
 def test_cspray_scanpy_expression_match(cspray_read_stage, scanpy_read_stage):
     sdata = cspray_read_stage
