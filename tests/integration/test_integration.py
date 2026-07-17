@@ -1,5 +1,6 @@
 import os
 import json
+import pytest
 from scipy.sparse import coo_matrix
 from scipy import stats
 import numpy as np
@@ -198,6 +199,50 @@ def test_metadata_dummy_roundtrip(dummy_h5ad_pair, spark_collect):
     vr = cs.md.profile(sdata, which='var', max_categorical=3, verbose=False).set_index('key')
     assert {'feature_type','highly_variable'}.issubset(set(vr.index))
     assert vr.loc['feature_type','suggested_action'] == 'drop_constant'
+
+def test_metadata_promote_suggested(dummy_h5ad_pair, spark_collect):
+    """promote_suggested: dry_run returns an editable plan without mutating, and
+    applying it materializes the recommended keys with inferred Spark types.
+
+    max_categorical=3 (via profile_kwargs) makes the classification deterministic
+    at this tiny scale, so only cell_type (obs) and highly_variable (var) are
+    'promote'; organism is drop_constant and the unique/mixed keys keep_in_variant.
+    """
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False, mode='delta',
+        obs_metadata_columns='all', var_metadata_columns='all',
+        metadata_variant=False, force_partitioning=2,
+    )
+
+    # --- dry_run: plan only, no mutation -----------------------------------
+    plan = cs.md.promote_suggested(
+        sdata, which='obs', profile_kwargs={'max_categorical': 3},
+        dry_run=True, verbose=False,
+    )
+    assert isinstance(plan, pd.DataFrame)
+    assert set(plan.columns) == {'which', 'key', 'dtype', 'suggested_action'}
+    plan_keys = set(plan['key'])
+    assert 'cell_type' in plan_keys        # promote
+    assert 'organism' not in plan_keys     # drop_constant
+    assert 'donor_id' not in plan_keys     # keep_in_variant (nd=6 > 3)
+    assert plan.set_index('key').loc['cell_type', 'dtype'] == 'string'
+    assert 'cell_type' not in sdata.obs.columns   # dry_run must not mutate
+
+    # --- apply across both axes, typed -------------------------------------
+    cs.md.promote_suggested(
+        sdata, which='both', profile_kwargs={'max_categorical': 3}, verbose=False,
+    )
+    assert 'cell_type' in sdata.obs.columns          # obs promote
+    assert 'highly_variable' in sdata.var.columns    # var promote
+    # inferred types: str -> string, bool -> boolean
+    assert sdata.obs.schema['cell_type'].dataType.simpleString() == 'string'
+    assert sdata.var.schema['highly_variable'].dataType.simpleString() == 'boolean'
+    obs = sdata.obs.select('cell_barcode', 'cell_type').toPandas().set_index('cell_barcode')
+    assert obs.loc['cA0', 'cell_type'] == 'T'
+
+    # --- guard: keys override not allowed with which='both' ----------------
+    with pytest.raises(ValueError):
+        cs.md.promote_suggested(sdata, which='both', keys=['cell_type'])
 
 def test_cspray_scanpy_expression_match(cspray_read_stage, scanpy_read_stage):
     sdata = cspray_read_stage

@@ -14,7 +14,18 @@ top-level columns for filtering.
 Public API (exposed as ``cs.md``):
 - ``profile(sdata, which='obs'|'var', per_file=..., ...)`` -> pandas report
 - ``profile_obs`` / ``profile_var`` -> thin convenience wrappers
-- ``promote(sdata, keys, which='obs'|'var', ...)`` -> materialize keys as columns
+- ``promote(sdata, keys, which='obs'|'var', ...)`` -> materialize given keys as columns
+- ``promote_suggested(sdata, which='obs'|'var'|'both', ...)`` -> profile + promote
+  the recommended keys (typed) in one call
+
+Promotion offers three paths depending on how much control you want:
+
+1. Automatic  -> ``promote_suggested(sdata, which='both')`` profiles and
+   promotes the recommended keys with inferred types in one call.
+2. Review-then-apply -> ``promote_suggested(..., dry_run=True)`` returns the
+   plan (key -> dtype -> action) to edit, then you call ``promote`` with it.
+3. Full manual -> use ``profile`` + ``promote`` directly with your own key list
+   and ``dtypes``.
 
 The implementation is axis-agnostic (obs and var differ only in the source
 DataFrame, the payload column, and the row-key) and works on both VARIANT and
@@ -44,6 +55,31 @@ _EXPLODE_SCHEMA = T.StructType(
         T.StructField("vtype", T.StringType()),
     ]
 )
+
+# Maps the JSON value types reported by profile() (in the `value_types` column)
+# to the Spark type promote() should cast to. Nested / mixed types fall back to
+# string. Editable by callers that want different defaults.
+DEFAULT_VARIANT_TYPE_MAP = {
+    "int": "bigint",
+    "float": "double",
+    "bool": "boolean",
+    "str": "string",
+    "object": "string",
+    "array": "string",
+}
+
+
+def _spark_type_from_value_types(value_types, type_map=None) -> str:
+    """Pick a Spark type for a key from the JSON value types profile() observed.
+
+    Returns the mapped type only when a single (non-null) JSON type was seen;
+    mixed types (a type conflict across rows/files) fall back to 'string'.
+    """
+    tm = type_map or DEFAULT_VARIANT_TYPE_MAP
+    non_null = [t for t in (value_types if value_types is not None else []) if t != "null"]
+    if len(set(non_null)) == 1:
+        return tm.get(non_null[0], "string")
+    return "string"
 
 
 def _resolve_axis(sdata, which: str):
@@ -424,7 +460,11 @@ def promote(
     """Materialize selected metadata keys into typed top-level columns.
 
     Extracts the given keys from the semi-structured payload into their own
-    columns on obs/var so they can be used for filtering/joins.
+    columns on obs/var so they can be used for filtering/joins. This is the
+    low-level, full-control primitive: you supply the exact keys and (optionally)
+    their types. For the common "promote everything worth filtering on, typed"
+    workflow, see :func:`promote_suggested`, which profiles and calls this for
+    you (and supports a ``dry_run`` review step).
 
     Parameters
     ----------
@@ -482,3 +522,157 @@ def promote(
         setattr(sdata, which, out)
         return sdata
     return out
+
+
+def _plan_for_axis(sdata, which, actions, keys, infer_types, dtypes, type_map, profile_kwargs):
+    """Build the promotion plan (key -> dtype) for one axis from a profile run."""
+    pk = dict(profile_kwargs or {})
+    pk["verbose"] = False
+    pk.pop("per_file", None)  # a plan needs the flat summary, not the (summary, matrix) tuple
+    report = profile(sdata, which=which, **pk)
+    if isinstance(report, tuple):  # defensive: per_file slipped through
+        report = report[0]
+
+    if keys is not None:
+        sel = report[report["key"].isin(list(keys))]
+    else:
+        sel = report[report["suggested_action"].isin(list(actions))]
+
+    plan = sel[["key", "suggested_action", "value_types"]].copy()
+
+    def _resolve(row):
+        if isinstance(dtypes, str):
+            return dtypes
+        if isinstance(dtypes, dict) and row["key"] in dtypes:
+            return dtypes[row["key"]]
+        if infer_types:
+            return _spark_type_from_value_types(row["value_types"], type_map)
+        return "string"
+
+    plan["dtype"] = plan.apply(_resolve, axis=1) if not plan.empty else []
+    plan.insert(0, "which", which)
+    return plan[["which", "key", "dtype", "suggested_action"]]
+
+
+def promote_suggested(
+    sdata,
+    which: str = "obs",
+    actions: Tuple[str, ...] = ("promote",),
+    keys: Optional[List[str]] = None,
+    infer_types: bool = True,
+    dtypes: Optional[Union[str, dict]] = None,
+    type_map: Optional[dict] = None,
+    prefix: str = "",
+    profile_kwargs: Optional[dict] = None,
+    dry_run: bool = False,
+    verbose: bool = True,
+):
+    """Profile, then promote the recommended keys as typed columns — in one call.
+
+    This is the high-level convenience path for the common workflow of
+    "materialize the metadata keys worth filtering on, with sensible types".
+    It runs :func:`profile`, selects the keys whose ``suggested_action`` is in
+    ``actions``, infers a Spark type for each from the profiled ``value_types``
+    (via :data:`DEFAULT_VARIANT_TYPE_MAP`), and calls :func:`promote`.
+
+    There are three paths, in increasing order of control — pick the one that
+    matches how much you want to intervene:
+
+    1. One call, fully automatic (types inferred, both axes if desired)::
+
+        cs.md.promote_suggested(sdata, which='both')
+
+    2. Review-then-apply: get the plan, edit it, apply it yourself. Use
+       ``dry_run=True`` to return the plan (key -> dtype -> action) WITHOUT
+       mutating ``sdata``, then hand your edited selection to :func:`promote`::
+
+        plan = cs.md.promote_suggested(sdata, which='obs', dry_run=True)
+        plan = plan[plan.key != 'unwanted_key']
+        cs.md.promote(sdata, plan.key.tolist(),
+                      dtypes=dict(zip(plan.key, plan.dtype)), which='obs')
+
+    3. Full manual control: skip this function and use :func:`profile` +
+       :func:`promote` directly, supplying your own key list and ``dtypes``.
+
+    Parameters
+    ----------
+    sdata : SprayData
+    which : str
+        'obs', 'var', or 'both' (loops obs then var). ``keys`` is not allowed
+        with 'both'.
+    actions : tuple of str
+        Which ``suggested_action`` values to promote. Defaults to
+        ``('promote',)``; pass ``('promote', 'promote_sparse')`` to also include
+        partial-coverage categoricals.
+    keys : list of str, optional
+        Explicit keys to promote, bypassing the ``actions`` filter. Only valid
+        for a single axis (not 'both').
+    infer_types : bool
+        If True (default) infer each column's Spark type from the profiled
+        value types; if False everything is promoted as string (unless
+        overridden by ``dtypes``).
+    dtypes : str or dict, optional
+        Explicit type override(s): a single string for all keys, or a
+        ``key -> type`` dict (takes precedence over inference for those keys).
+    type_map : dict, optional
+        Override the JSON-type -> Spark-type mapping (defaults to
+        :data:`DEFAULT_VARIANT_TYPE_MAP`).
+    prefix : str
+        Prefix for the promoted column names (guards against collisions with
+        existing columns).
+    profile_kwargs : dict, optional
+        Extra keyword args forwarded to :func:`profile` (e.g. ``max_categorical``,
+        ``sample``). ``verbose`` and ``per_file`` are managed internally.
+    dry_run : bool
+        If True, return the promotion plan (a pandas DataFrame with columns
+        ``which, key, dtype, suggested_action``) and do NOT modify ``sdata``.
+    verbose : bool
+        If True (default) print the plan before applying.
+
+    Returns
+    -------
+    SprayData or pandas.DataFrame
+        The updated ``sdata`` (when applied), or the plan DataFrame (when
+        ``dry_run=True``).
+
+    See Also
+    --------
+    profile : the read-only report this builds on.
+    promote : the low-level, full-control materialization primitive.
+    """
+    if which not in ("obs", "var", "both"):
+        raise ValueError(f"which must be 'obs', 'var', or 'both', got {which!r}")
+    if keys is not None and which == "both":
+        raise ValueError("keys= is only supported for a single axis, not which='both'")
+
+    axes = ["obs", "var"] if which == "both" else [which]
+    plans = [
+        _plan_for_axis(sdata, ax, actions, keys, infer_types, dtypes, type_map, profile_kwargs)
+        for ax in axes
+    ]
+    plan = pd.concat(plans, ignore_index=True) if plans else pd.DataFrame(
+        columns=["which", "key", "dtype", "suggested_action"]
+    )
+
+    if verbose or dry_run:
+        if plan.empty:
+            print("promote_suggested: no keys matched — nothing to promote.")
+        else:
+            print(f"promote_suggested plan ({len(plan)} columns):")
+            print(plan.to_string(index=False))
+
+    if dry_run:
+        return plan
+
+    for ax in axes:
+        ax_plan = plan[plan["which"] == ax]
+        ks = ax_plan["key"].tolist()
+        if ks:
+            promote(
+                sdata,
+                ks,
+                which=ax,
+                prefix=prefix,
+                dtypes=dict(zip(ax_plan["key"], ax_plan["dtype"])),
+            )
+    return sdata
