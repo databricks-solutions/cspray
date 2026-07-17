@@ -54,6 +54,64 @@ def downloaded_file():
     os.remove(temp_file.name)
 
 @pytest.fixture(scope="module")
+def dummy_h5ad_pair():
+    """Two tiny hand-built h5ad files with deliberately different obs schemas.
+
+    Known values let tests assert exact per-row metadata assignment, coverage,
+    action classification, per-file localisation, and promotion. Two files (not
+    one) are needed because within a single file every row has every column, so
+    partial coverage / per-file / alias / type-conflict only arise across files.
+    """
+    import anndata as ad
+    from scipy.sparse import csr_matrix
+
+    # File A: 3 cells x 4 genes (X must be CSR for cspray's format check)
+    A = ad.AnnData(
+        X=csr_matrix(np.arange(12, dtype="float32").reshape(3, 4)),
+        obs=pd.DataFrame({
+            "cell_type": pd.Categorical(["T", "B", "T"]),  # categorical path
+            "donor_id":  ["dA0", "dA1", "dA2"],            # unique -> id-like
+            "organism":  ["human", "human", "human"],      # constant
+            "n_genes":   [10, 20, 30],
+            "qc_score":  [0.1, 0.2, 0.3],
+            "CellType":  ["T", "B", "T"],                  # alias of cell_type, file A only
+            "mixed":     [1, 2, 3],                        # int here...
+        }, index=["cA0", "cA1", "cA2"]),
+        var=pd.DataFrame({
+            "feature_type": ["gene"] * 4,
+            "highly_variable": [True, False, True, False],
+        }, index=["g0", "g1", "g2", "g3"]),
+    )
+
+    # File B: 3 cells, different obs schema
+    B = ad.AnnData(
+        X=csr_matrix(np.arange(12, 24, dtype="float32").reshape(3, 4)),
+        obs=pd.DataFrame({
+            "cell_type": pd.Categorical(["T", "B", "B"]),
+            "donor_id":  ["dB0", "dB1", "dB2"],
+            "organism":  ["human", "human", "human"],
+            "n_genes":   [15, 25, 35],
+            "qc_score":  [0.15, 0.25, 0.35],
+            "batch":     ["b1", "b1", "b2"],               # file B only -> 50% coverage
+            "mixed":     ["x", "y", "z"],                  # ...str here -> type conflict
+        }, index=["cB0", "cB1", "cB2"]),
+        var=pd.DataFrame({
+            "feature_type": ["gene"] * 4,
+            "highly_variable": [True, True, False, False],
+        }, index=["g0", "g1", "g2", "g3"]),
+    )
+
+    fa = tempfile.NamedTemporaryFile(delete=False, suffix=".h5ad")
+    fb = tempfile.NamedTemporaryFile(delete=False, suffix=".h5ad")
+    A.write(fa.name)
+    B.write(fb.name)
+
+    yield [fa.name, fb.name]
+
+    os.remove(fa.name)
+    os.remove(fb.name)
+
+@pytest.fixture(scope="module")
 def scanpy_read_stage(downloaded_file):
     adata = sc.read_h5ad(
         downloaded_file,

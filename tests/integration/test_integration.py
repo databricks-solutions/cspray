@@ -3,8 +3,10 @@ import json
 from scipy.sparse import coo_matrix
 from scipy import stats
 import numpy as np
+import pandas as pd
 
 from cspray.data import SprayData
+import cspray as cs
 
 # to be placed in SprayData later as part of to_anndata method
 def sdata_to_csr(sdata, expression_col = 'expression'):
@@ -84,6 +86,118 @@ def test_cspray_metadata_chunked(downloaded_file, spark_collect, scanpy_read_sta
     # metadata payload round-trips to a JSON object per row
     sample = sdata.obs.select('obs_data').limit(1).toPandas()['obs_data'].iloc[0]
     assert isinstance(json.loads(sample), dict)
+
+
+def test_cspray_metadata_profile_and_promote(downloaded_file, spark_collect):
+    """cs.md.profile summarizes the obs/var metadata payload (key coverage,
+    cardinality, suggested actions) and cs.md.promote materializes chosen keys.
+
+    Uses metadata_variant=False (JSON string) so the whole path is portable to
+    OSS Spark: profile normalizes to JSON text and profiles via mapInPandas +
+    standard aggregations, and promote uses get_json_object.
+    """
+    sdata = SprayData.from_h5ads(
+        spark_collect,
+        path=downloaded_file,
+        force_partitioning=4,
+        from_raw=False,
+        mode='delta',
+        obs_metadata_columns='all',
+        var_metadata_columns='all',
+        metadata_variant=False,
+    )
+
+    n_cells = sdata.obs.count()
+
+    # --- profile obs -------------------------------------------------------
+    report = cs.md.profile(sdata, which='obs', verbose=False)
+    assert isinstance(report, pd.DataFrame)
+    assert not report.empty
+    expected_cols = {
+        'key', 'present', 'missing', 'coverage_pct', 'tag',
+        'n_distinct', 'value_types', 'type_conflict',
+        'possible_alias', 'suggested_action',
+    }
+    assert expected_cols.issubset(set(report.columns))
+
+    # coverage arithmetic is internally consistent
+    assert (report['present'] + report['missing'] == n_cells).all()
+    assert report['coverage_pct'].max() <= 100.0
+    # keys actually present in the raw obs payload show up in the report
+    obs_keys = set(
+        json.loads(sdata.obs.select('obs_data').limit(1).toPandas()['obs_data'].iloc[0]).keys()
+    )
+    assert obs_keys.issubset(set(report['key']))
+
+    # --- per_file view returns a (summary, matrix) tuple -------------------
+    summary, matrix = cs.md.profile(sdata, which='var', per_file=True, verbose=False)
+    assert isinstance(summary, pd.DataFrame)
+    assert isinstance(matrix, pd.DataFrame)
+
+    # --- promote a key into a top-level column -----------------------------
+    key = report['key'].iloc[0]
+    cs.md.promote(sdata, key, which='obs')
+    assert key in sdata.obs.columns
+    # one value per cell, extracted as a (string) column
+    assert sdata.obs.select(key).count() == n_cells
+
+def test_metadata_dummy_roundtrip(dummy_h5ad_pair, spark_collect):
+    """End-to-end metadata check on two hand-built h5ad files with known values:
+    pick-up, exact per-row assignment, coverage/action classification, per-file
+    localisation, and promotion. Uses metadata_variant=False for OSS portability.
+
+    max_categorical=3 makes the id-like/categorical split deterministic at this
+    tiny scale (the default present>50 id-like rule cannot fire on 6 rows).
+    """
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False, mode='delta',
+        obs_metadata_columns='all', var_metadata_columns='all',
+        metadata_variant=False, force_partitioning=2,
+    )
+
+    # 1. every cell carries metadata, keyed to the right barcode ------------
+    obs = sdata.obs.select('cell_barcode', 'obs_data').toPandas()
+    assert set(obs['cell_barcode']) == {'cA0','cA1','cA2','cB0','cB1','cB2'}
+    parsed = {r.cell_barcode: json.loads(r.obs_data) for r in obs.itertuples()}
+    assert parsed['cA0']['cell_type'] == 'T'
+    assert parsed['cA0']['n_genes'] == 10
+    assert parsed['cB2']['cell_type'] == 'B'
+    assert parsed['cB2']['batch'] == 'b2'
+    assert 'batch' not in parsed['cA0']       # file A never had it
+    assert 'CellType' not in parsed['cB0']    # file B never had it
+
+    # 2. profile: pick-up + coverage + classification -----------------------
+    r = cs.md.profile(sdata, which='obs', max_categorical=3, verbose=False).set_index('key')
+    assert set(r.index) == {
+        'cell_type','donor_id','organism','n_genes','qc_score','CellType','batch','mixed'}
+    assert r.loc['cell_type','coverage_pct'] == 100.0 and r.loc['cell_type','present'] == 6
+    assert r.loc['batch','coverage_pct'] == 50.0 and r.loc['batch','tag'] == 'partial'
+    assert r.loc['CellType','coverage_pct'] == 50.0
+
+    assert r.loc['organism','suggested_action'] == 'drop_constant'
+    assert r.loc['cell_type','suggested_action'] == 'promote'
+    assert r.loc['donor_id','suggested_action'] == 'keep_in_variant'   # nd=6 > 3
+    assert bool(r.loc['cell_type','possible_alias']) and bool(r.loc['CellType','possible_alias'])
+    assert bool(r.loc['mixed','type_conflict'])
+
+    # 3. per-file matrix -----------------------------------------------------
+    _, matrix = cs.md.profile(sdata, which='obs', per_file=True, verbose=False)
+    assert matrix.shape[1] == 2
+    assert set(matrix.loc['batch']) == {0.0, 100.0}
+    assert (matrix.loc['cell_type'] == 100.0).all()
+
+    # 4. promote (string + typed) -------------------------------------------
+    cs.md.promote(sdata, 'cell_type', which='obs')
+    cs.md.promote(sdata, 'n_genes', which='obs', dtypes='int')
+    prom = sdata.obs.select('cell_barcode','cell_type','n_genes').toPandas().set_index('cell_barcode')
+    assert prom.loc['cA0','cell_type'] == 'T'
+    assert int(prom.loc['cA1','n_genes']) == 20
+    assert int(prom.loc['cB2','n_genes']) == 35
+
+    # 5. var side, briefly ---------------------------------------------------
+    vr = cs.md.profile(sdata, which='var', max_categorical=3, verbose=False).set_index('key')
+    assert {'feature_type','highly_variable'}.issubset(set(vr.index))
+    assert vr.loc['feature_type','suggested_action'] == 'drop_constant'
 
 def test_cspray_scanpy_expression_match(cspray_read_stage, scanpy_read_stage):
     sdata = cspray_read_stage
