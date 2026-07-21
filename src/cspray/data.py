@@ -152,7 +152,11 @@ class SprayData:
         ensembl_reference_df: Optional[pyspark.sql.DataFrame]= None,
         from_raw:Optional[bool]=True,
         fallback_default:Optional[bool]=False,
-        mode:Optional[str]=None
+        mode:Optional[str]=None,
+        obs_metadata_columns: Optional[Union[str, List[str]]] = None,
+        var_metadata_columns: Optional[Union[str, List[str]]] = None,
+        metadata_variant: Optional[bool] = True,
+        metadata_chunk_size: Optional[int] = 50_000,
     ):
         """ Read h5ad files into SprayData object 
 
@@ -161,6 +165,14 @@ class SprayData:
         enforcement of h5ad files we only extract the key information for processing
         - additional information from obs can always be processed out and joined in sperately 
         later (if you have some schema in your data) as those files are significantly smaller. 
+
+        The flexible, non-key obs/var columns can optionally be carried through as a single
+        semi-structured column (`obs_data` on obs, `var_data` on var) via the
+        obs_metadata_columns / var_metadata_columns arguments. This sidesteps the
+        cross-file schema heterogeneity of h5ad (different files can have different
+        obs/var columns) by storing each row's extra columns as a VARIANT (or JSON
+        string). The processing pipeline continues to operate on the skinny key
+        columns; the metadata column simply rides along on obs/var.
 
         parameters:
         -----------
@@ -174,6 +186,10 @@ class SprayData:
         ensembl_reference_df: an optional reference df of ensembl gene ids to gene names, if provided will use instead of h5ad provided gene names
         from_raw: if True will read from raw group in h5ad
         fallback_default: if True will fallback to default read if no raw group (only used if from_raw=True)
+        obs_metadata_columns: 'all' or list of obs column names to capture into an `obs_data` column. None (default) captures none.
+        var_metadata_columns: 'all' or list of var column names to capture into a `var_data` column. None (default) captures none.
+        metadata_variant: if True (default) metadata columns are stored as VARIANT (needs Spark 3.5+/DBR 15.3+); if False they are kept as JSON strings.
+        metadata_chunk_size: number of obs/var rows (cells/genes) read per chunk. Bounds per-worker memory independent of file size; files smaller than this read in a single chunk. None reads each file whole. Defaults to 50,000.
         """
 
 
@@ -194,6 +210,9 @@ class SprayData:
             from_raw=from_raw,
             fallback_default=fallback_default,
             force_partitioning=force_partitioning,
+            metadata_columns=var_metadata_columns,
+            metadata_variant=metadata_variant,
+            metadata_chunk_size=metadata_chunk_size,
         )
         
         obs = read_obs_from_h5ads(
@@ -201,6 +220,9 @@ class SprayData:
             path=path,
             df=df,
             force_partitioning=force_partitioning,
+            metadata_columns=obs_metadata_columns,
+            metadata_variant=metadata_variant,
+            metadata_chunk_size=metadata_chunk_size,
         ) # we assume obs always in regular and not raw
         
         if ensembl_reference_df is not None:

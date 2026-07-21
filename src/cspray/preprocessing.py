@@ -72,15 +72,20 @@ def make_var_names_unique(sdata, remove_null_genes=True):
     print(f"Deduplicating gene_names...")
     
     # Deduplicate var
+    agg_exprs = [
+        F.min('gene_idx').alias('gene_idx'),
+        F.first('gene_id').alias('gene_id'), # exact mapping could change here but its not so important 
+        F.concat_ws('|', F.collect_set('original_provided_gene_name')).alias('original_provided_gene_name')
+    ]
+    # carry the variant/JSON metadata column through the dedup if present
+    # (groupBy would otherwise drop it); dedup is already lossy for genes so
+    # keeping the representative row's metadata is consistent with gene_id above
+    if 'var_data' in new_var.columns:
+        agg_exprs.append(F.first('var_data').alias('var_data'))
     new_var = (
         new_var
         .groupBy('fp_int', 'gene_name')
-        .agg(
-            F.min('gene_idx').alias('gene_idx'),
-            F.first('gene_id').alias('gene_id'), # exact mapping could change here but its not so important 
-            F.first('fp_int').alias('fp_int'),
-            F.concat_ws('|', F.collect_set('original_provided_gene_name')).alias('original_provided_gene_name')
-        )
+        .agg(*agg_exprs)
     ).repartition(sdata.var.rdd.getNumPartitions(), 'fp_int')
     
     # Add file_path back (lost in groupBy at line 77)
