@@ -112,6 +112,41 @@ def dummy_h5ad_pair():
     os.remove(fb.name)
 
 @pytest.fixture(scope="module")
+def dummy_h5ad_categorical_index():
+    """A tiny h5ad whose obs index is stored as a categorical (a group on disk).
+
+    Some real-world files set the obs index from a categorical column, so the
+    `_index` element becomes an h5py group (codes/categories) rather than a flat
+    dataset. This exercises the row-count path (`udf_get_n_obs`) which must fall
+    back to the codes length instead of assuming a `.shape`.
+    """
+    import anndata as ad
+    from scipy.sparse import csr_matrix
+
+    obs = pd.DataFrame(
+        {
+            "cell_type": pd.Categorical(["T", "B", "T"]),
+            "n_genes": [10, 20, 30],
+        },
+        index=pd.CategoricalIndex(["cA0", "cA1", "cA2"], name="barcode"),
+    )
+    adata = ad.AnnData(
+        X=csr_matrix(np.arange(12, dtype="float32").reshape(3, 4)),
+        obs=obs,
+        var=pd.DataFrame(
+            {"feature_type": ["gene"] * 4},
+            index=["g0", "g1", "g2", "g3"],
+        ),
+    )
+
+    f = tempfile.NamedTemporaryFile(delete=False, suffix=".h5ad")
+    adata.write(f.name)
+
+    yield f.name
+
+    os.remove(f.name)
+
+@pytest.fixture(scope="module")
 def scanpy_read_stage(downloaded_file):
     adata = sc.read_h5ad(
         downloaded_file,

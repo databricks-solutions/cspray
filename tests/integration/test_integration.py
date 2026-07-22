@@ -244,6 +244,23 @@ def test_metadata_promote_suggested(dummy_h5ad_pair, spark_collect):
     with pytest.raises(ValueError):
         cs.md.promote_suggested(sdata, which='both', keys=['cell_type'])
 
+def test_categorical_index_row_count(dummy_h5ad_categorical_index, spark_collect):
+    """Regression: obs whose index is categorical is stored as an h5py group, so
+    the row-count path must use the codes length rather than a `.shape` on the
+    index element. Reads a file with a categorical obs index end-to-end.
+    """
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_categorical_index, from_raw=False,
+        mode='delta', force_partitioning=1,
+    )
+
+    # all three cells are read despite the categorical (group-encoded) index
+    assert sdata.obs.count() == 3
+    assert sdata.var.count() == 4
+
+    cell_idx = sdata.obs.select('cell_idx').toPandas()['cell_idx'].values
+    assert set(cell_idx) == {0, 1, 2}
+
 def test_cspray_scanpy_expression_match(cspray_read_stage, scanpy_read_stage):
     sdata = cspray_read_stage
     adata = scanpy_read_stage
