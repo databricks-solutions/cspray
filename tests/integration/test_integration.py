@@ -261,6 +261,31 @@ def test_categorical_index_row_count(dummy_h5ad_categorical_index, spark_collect
     cell_idx = sdata.obs.select('cell_idx').toPandas()['cell_idx'].values
     assert set(cell_idx) == {0, 1, 2}
 
+def test_categorical_chunked_decode(dummy_h5ad_categorical_index, spark_collect):
+    """Categoricals are decoded per-chunk by reading only the referenced
+    categories and renumbering the codes. With metadata_chunk_size=2 the 3-row
+    file splits across a chunk boundary (rows 0-1, then row 2), so different
+    chunks see different category subsets; the decoded values must still be
+    correct. Guards the bounded-categorical-read path.
+    """
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_categorical_index, from_raw=False,
+        mode='delta', force_partitioning=1,
+        obs_metadata_columns='all', metadata_variant=False,
+        metadata_chunk_size=2,
+    )
+
+    obs = sdata.obs.select('cell_barcode', 'obs_data').toPandas()
+    # categorical index barcodes decode correctly across the chunk boundary
+    assert set(obs['cell_barcode']) == {'cA0', 'cA1', 'cA2'}
+    parsed = {r.cell_barcode: json.loads(r.obs_data) for r in obs.itertuples()}
+    # cell_type is categorical; row 2 (cA2) is in a chunk that only references 'T'
+    assert parsed['cA0']['cell_type'] == 'T'
+    assert parsed['cA1']['cell_type'] == 'B'
+    assert parsed['cA2']['cell_type'] == 'T'
+    assert parsed['cA0']['n_genes'] == 10
+    assert parsed['cA2']['n_genes'] == 30
+
 def test_cspray_scanpy_expression_match(cspray_read_stage, scanpy_read_stage):
     sdata = cspray_read_stage
     adata = scanpy_read_stage
