@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import pytest
 from scipy.sparse import coo_matrix
 from scipy import stats
@@ -8,6 +9,36 @@ import pandas as pd
 
 from cspray.data import SprayData
 import cspray as cs
+
+# --- metadata round-trip comparison helpers --------------------------------
+# The obs/var metadata payload is serialized to JSON (VARIANT/string), which is
+# intentionally lossy in predictable ways: NaN/NA/NaT -> null, one JSON number
+# type, bytes vs str, float precision. Normalize both sides before comparing.
+_MISSING = object()
+
+def _norm(v):
+    if v is None:
+        return _MISSING
+    try:
+        if pd.isna(v):
+            return _MISSING          # np.nan, pd.NA, NaT
+    except (TypeError, ValueError):
+        pass                         # pd.isna raises on some non-scalars
+    if isinstance(v, (bytes, np.bytes_)):
+        v = v.decode()
+    if isinstance(v, (bool, np.bool_)):   # bool before int (bool is a subclass)
+        return bool(v)
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return float(v)                   # JSON has a single number type
+    return str(v)
+
+def _values_match(a, b):
+    na, nb = _norm(a), _norm(b)
+    if na is _MISSING or nb is _MISSING:
+        return na is nb                   # match only if both missing
+    if isinstance(na, float) and isinstance(nb, float):
+        return math.isclose(na, nb, rel_tol=1e-9, abs_tol=1e-12)
+    return na == nb
 
 # to be placed in SprayData later as part of to_anndata method
 def sdata_to_csr(sdata, expression_col = 'expression'):
@@ -243,6 +274,95 @@ def test_metadata_promote_suggested(dummy_h5ad_pair, spark_collect):
     # --- guard: keys override not allowed with which='both' ----------------
     with pytest.raises(ValueError):
         cs.md.promote_suggested(sdata, which='both', keys=['cell_type'])
+
+def test_categorical_index_row_count(dummy_h5ad_categorical_index, spark_collect):
+    """Regression: obs whose index is categorical is stored as an h5py group, so
+    the row-count path must use the codes length rather than a `.shape` on the
+    index element. Reads a file with a categorical obs index end-to-end.
+    """
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_categorical_index, from_raw=False,
+        mode='delta', force_partitioning=1,
+    )
+
+    # all three cells are read despite the categorical (group-encoded) index
+    assert sdata.obs.count() == 3
+    assert sdata.var.count() == 4
+
+    cell_idx = sdata.obs.select('cell_idx').toPandas()['cell_idx'].values
+    assert set(cell_idx) == {0, 1, 2}
+
+def test_categorical_chunked_decode(dummy_h5ad_categorical_index, spark_collect):
+    """Categoricals are decoded per-chunk by reading only the referenced
+    categories and renumbering the codes. With metadata_chunk_size=2 the 3-row
+    file splits across a chunk boundary (rows 0-1, then row 2), so different
+    chunks see different category subsets; the decoded values must still be
+    correct. Guards the bounded-categorical-read path.
+    """
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_categorical_index, from_raw=False,
+        mode='delta', force_partitioning=1,
+        obs_metadata_columns='all', metadata_variant=False,
+        metadata_chunk_size=2,
+    )
+
+    obs = sdata.obs.select('cell_barcode', 'obs_data').toPandas()
+    # categorical index barcodes decode correctly across the chunk boundary
+    assert set(obs['cell_barcode']) == {'cA0', 'cA1', 'cA2'}
+    parsed = {r.cell_barcode: json.loads(r.obs_data) for r in obs.itertuples()}
+    # cell_type is categorical; row 2 (cA2) is in a chunk that only references 'T'
+    assert parsed['cA0']['cell_type'] == 'T'
+    assert parsed['cA1']['cell_type'] == 'B'
+    assert parsed['cA2']['cell_type'] == 'T'
+    assert parsed['cA0']['n_genes'] == 10
+    assert parsed['cA2']['n_genes'] == 30
+
+@pytest.mark.parametrize("metadata_chunk_size", [100, 1])
+def test_metadata_matches_scanpy_chunked(downloaded_file, spark_collect, scanpy_read_stage, metadata_chunk_size):
+    """Strongest metadata oracle: read the full file with a chunk size far smaller
+    than the number of rows (forcing many chunk boundaries) and confirm every
+    obs/var column value matches scanpy's AnnData for every row, keyed by
+    barcode / gene id. Guards value-level correctness of chunked ingestion
+    (incl. the bounded-categorical decode), not just counts/indices.
+    """
+    adata = scanpy_read_stage
+    sdata = SprayData.from_h5ads(
+        spark_collect,
+        path=downloaded_file,
+        from_raw=False,
+        mode='delta',
+        obs_metadata_columns='all',
+        var_metadata_columns='all',
+        metadata_variant=False,
+        metadata_chunk_size=metadata_chunk_size,
+    )
+
+    # --- obs: compare every column of every cell, keyed by barcode ----------
+    obs_got = sdata.obs.select('cell_barcode', 'obs_data').toPandas()
+    assert len(obs_got) == adata.n_obs
+    assert set(obs_got['cell_barcode']) == set(map(str, adata.obs.index))
+    # payload keys cover exactly the (non-index) obs columns
+    sample_keys = set(json.loads(obs_got['obs_data'].iloc[0]).keys())
+    assert sample_keys == set(adata.obs.columns)
+
+    for bc, payload in ((r.cell_barcode, json.loads(r.obs_data)) for r in obs_got.itertuples()):
+        expected_row = adata.obs.loc[bc]
+        for col, got_val in payload.items():
+            assert _values_match(got_val, expected_row[col]), (
+                f"obs mismatch bc={bc} col={col}: got={got_val!r} exp={expected_row[col]!r}"
+            )
+
+    # --- var: same check, keyed by gene id ---------------------------------
+    var_got = sdata.var.select('gene_id', 'var_data').toPandas()
+    assert set(var_got['gene_id']) == set(map(str, adata.var.index))
+    for gid, payload in ((r.gene_id, json.loads(r.var_data)) for r in var_got.itertuples()):
+        expected_row = adata.var.loc[gid]
+        for col, got_val in payload.items():
+            if col not in adata.var.columns:
+                continue   # cspray may carry a derived gene_name col not in raw var
+            assert _values_match(got_val, expected_row[col]), (
+                f"var mismatch gid={gid} col={col}: got={got_val!r} exp={expected_row[col]!r}"
+            )
 
 def test_cspray_scanpy_expression_match(cspray_read_stage, scanpy_read_stage):
     sdata = cspray_read_stage

@@ -190,12 +190,30 @@ def udf_get_raw_maxsize(path):
     size = file['raw']['X']['data'].shape[0]
     return size
 
+def _index_n_rows(group):
+    """Number of rows in an h5ad obs/var group, from its index element.
+
+    The `_index` attribute names the element holding the axis index. Usually
+    that's a flat dataset (string array) whose length is the row count. But when
+    the index is a categorical-encoded column it's stored as a *group* (with
+    `codes`/`categories` datasets and no `.shape`), so we fall back to the length
+    of the `codes` array, which has one entry per row.
+    """
+    idx = group[group.attrs['_index']]
+    if isinstance(idx, h5py.Dataset):
+        return int(idx.shape[0])
+    if isinstance(idx, h5py.Group) and 'codes' in idx:
+        return int(idx['codes'].shape[0])
+    raise ValueError(
+        f"Unexpected index encoding for group {group.name!r}: {idx}"
+    )
+
 @F.udf(returnType=T.LongType())
 def udf_get_n_obs(path):
-    """Number of cells (obs rows). Reads only the index dataset shape, no data."""
+    """Number of cells (obs rows). Reads only the index shape, no data."""
     file = h5py.File(path, 'r')
     group = file['obs']
-    return int(group[group.attrs['_index']].shape[0])
+    return _index_n_rows(group)
 
 def make_n_var_udf(from_raw: bool, fallback_default: bool):
     """Factory for a UDF returning the number of genes (var rows).
@@ -216,7 +234,7 @@ def make_n_var_udf(from_raw: bool, fallback_default: bool):
                 return -1
         else:
             group = file['var']
-        return int(group[group.attrs['_index']].shape[0])
+        return _index_n_rows(group)
     return _udf_get_n_var
 
 def _explode_row_ranges(sdf, count_col: str, chunk_size: Optional[int], force_partitioning: Optional[int]):
@@ -406,6 +424,38 @@ def process_type(v, start : int = 0, end : Optional[int] = None):
     else:
         return v[sl]
     
+def _read_categorical_slice(group, start : int = 0, end : Optional[int] = None):
+    """Decode a categorical-encoded h5ad element for the row range ``[start:end)``.
+
+    An h5ad categorical is a group of ``codes`` (one int per row, -1 == missing)
+    and ``categories`` (the distinct values). The naive decode reads the *entire*
+    categories array per chunk, so per-chunk memory scales with the column's
+    cardinality rather than the slice size — catastrophic for high-cardinality
+    columns (e.g. a categorical index whose categories are all n_obs barcodes).
+
+    Instead we slice the codes, then read only the categories actually referenced
+    by that slice (a targeted h5py fancy read), and renumber the codes to index
+    the reduced category list. The result is identical to the full decode but the
+    categories read is bounded by the number of distinct values in the slice
+    (<= chunk size), keeping per-chunk memory proportional to the chunk.
+    """
+    codes = process_type(group['codes'], start=start, end=end)
+    codes = np.asarray(codes)
+    mask = codes >= 0
+    used = np.unique(codes[mask])  # sorted, unique, ascending -> valid h5py fancy index
+
+    cats_ds = group['categories']
+    if used.size == 0:
+        cats = np.empty(0, dtype=object)
+    elif cats_ds.dtype.kind in ('S', 'O'):
+        cats = cats_ds.asstr()[used]
+    else:
+        cats = cats_ds[used]
+
+    local = np.full(codes.shape, -1, dtype=np.int64)
+    local[mask] = np.searchsorted(used, codes[mask])
+    return pd.Series(pd.Categorical.from_codes(local, cats))
+
 def h5_group_pdf_to_dict(group, keys : Optional[List[str]] = None, start : int = 0, end : Optional[int] = None):
     """
     Converts an H5AD group to a dictionary of arrays or Series. Useful for dataframe type extraction.
@@ -421,8 +471,9 @@ def h5_group_pdf_to_dict(group, keys : Optional[List[str]] = None, start : int =
         Inclusive start row of the slice to read for each column. Defaults to 0.
     end : int, optional
         Exclusive end row of the slice to read for each column. Defaults to None
-        (read to the end). For categoricals only the codes are sliced; the
-        (small) categories list is always read in full.
+        (read to the end). For categoricals both the codes and the referenced
+        categories are sliced, so per-chunk memory scales with the slice rather
+        than the column's cardinality (see :func:`_read_categorical_slice`).
 
     Returns
     -------
@@ -441,10 +492,7 @@ def h5_group_pdf_to_dict(group, keys : Optional[List[str]] = None, start : int =
             data_dict[key] = process_type(group[key], start=start, end=end)
         except:
             try:
-                data_dict[key] = pd.Series(pd.Categorical.from_codes(
-                    process_type(group[key]['codes'], start=start, end=end),
-                    process_type(group[key]['categories'])
-                ))
+                data_dict[key] = _read_categorical_slice(group[key], start=start, end=end)
             except Exception as e:
                 logging.warn(f"key: {key}, does not behave according to expected rules. Error: {e}")
     return data_dict
