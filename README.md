@@ -102,6 +102,63 @@ cs.tl.as_gold_mart_data(sdata)
 sdata.to_tables_and_reset(spark,table_base='singlecell.gold', join_char='.') 
 ```
 
+### Metadata
+
+h5ad files disagree on which obs/var columns exist, so the flexible non-key
+columns are captured at read time into a single semi-structured column
+(`obs_data` on obs, `var_data` on var) as VARIANT or a JSON string. Reading only
+captures; you then decide what to materialize as typed columns, and where those
+columns belong:
+
+```
+sdata = SprayData.from_h5ads(
+    spark,
+    path=path,
+    obs_metadata_columns='all',
+    var_metadata_columns='all',
+)
+
+# What is in the payload? (coverage, cardinality, types, suggested action)
+report = cs.md.profile(sdata, which='obs')
+
+# Materialize per-cell keys worth filtering on, either explicitly ...
+cs.md.promote(sdata, ['cell_type'], which='obs', dtypes='string')
+# ... or from the profile's suggestions (dry_run returns an editable plan)
+plan = cs.md.promote_suggested(sdata, which='both', dry_run=True)
+cs.md.promote_suggested(sdata, which='both')
+
+# promote_sam=True additionally routes keys that are constant within a file to
+# the sample table, so they are not repeated on every cell
+cs.md.promote_suggested(sdata, which='both', promote_sam=True)
+```
+
+#### Sample metadata
+
+`sam` is seeded during every h5ad read with one row per input file (`fp_int`,
+`file_path`) and acts as the sample registry. Metadata that is constant within a
+file (tissue, assay, donor for single-donor files) belongs there rather than
+repeated on every cell:
+
+```
+# Which obs keys are constant within each file?
+cs.md.profile_sample(sdata)
+
+# Promote them to sam (also drops the duplicated top-level obs column)
+cs.md.promote_sample(sdata, ['tissue', 'assay'], dtypes='string')
+# or take the suggestions, with dry_run to review first
+cs.md.promote_sample_suggested(sdata)
+```
+
+Doing this as part of the obs/var pass with
+`cs.md.promote_suggested(sdata, which='both', promote_sam=True)` is equivalent and
+keeps sample-constant keys out of the obs plan entirely, so nothing is
+materialized per cell only to be dropped again.
+
+Sample metadata from outside the h5ad files (study design, donor tables) can be
+attached at any point with `cs.md.add_sample_metadata(sdata, metadata_df,
+on='file_path')`. QC metrics, promoted obs metadata, and user metadata each add
+their own columns to `sam`, so they can run in any order.
+
 
 
 ### Run tests

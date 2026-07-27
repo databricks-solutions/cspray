@@ -121,8 +121,10 @@ class SprayData:
             Small DataFrame with columns: fp_int, file_path
         """
         if self._file_mapping is None:
-            # Try to get from var (smallest table with both columns)
-            if self.var is not None:
+            # sam is the sample identity table and preferred source of truth.
+            if self.sam is not None:
+                self._file_mapping = self.sam.select('fp_int', 'file_path').distinct()
+            elif self.var is not None:
                 self._file_mapping = self.var.select('fp_int', 'file_path').distinct()
             elif self.obs is not None:
                 self._file_mapping = self.obs.select('fp_int', 'file_path').distinct()
@@ -138,7 +140,7 @@ class SprayData:
         Call this if you modify file_path or fp_int columns.
         """
         self._file_mapping = None
-        
+
     @classmethod
     def from_h5ads(
         cls, 
@@ -173,6 +175,11 @@ class SprayData:
         obs/var columns) by storing each row's extra columns as a VARIANT (or JSON
         string). The processing pipeline continues to operate on the skinny key
         columns; the metadata column simply rides along on obs/var.
+
+        `sam` is seeded here with one row per input file (fp_int, file_path) so it can
+        act as the sample registry for later additions - QC metrics, obs metadata that
+        is constant within a file (cs.md.promote_sample), or metadata from outside the
+        files (cs.md.add_sample_metadata).
 
         parameters:
         -----------
@@ -251,6 +258,7 @@ class SprayData:
             X=X,
             var=var,
             obs=obs,
+            sam=obs.select('fp_int', 'file_path').distinct(),
             mode=mode
         )
 

@@ -1,5 +1,4 @@
 import pytest
-import requests
 import tempfile
 import os
 import shutil
@@ -7,7 +6,6 @@ import shutil
 import gget
 import cellxgene_census
 
-import pooch
 import scanpy as sc
 from cspray.data import SprayData
 import cspray as cs
@@ -70,6 +68,7 @@ def dummy_h5ad_pair():
         X=csr_matrix(np.arange(12, dtype="float32").reshape(3, 4)),
         obs=pd.DataFrame({
             "cell_type": pd.Categorical(["T", "B", "T"]),  # categorical path
+            "tissue":     ["lung", "lung", "lung"],         # sample-level, differs by file
             "donor_id":  ["dA0", "dA1", "dA2"],            # unique -> id-like
             "organism":  ["human", "human", "human"],      # constant
             "n_genes":   [10, 20, 30],
@@ -88,6 +87,7 @@ def dummy_h5ad_pair():
         X=csr_matrix(np.arange(12, 24, dtype="float32").reshape(3, 4)),
         obs=pd.DataFrame({
             "cell_type": pd.Categorical(["T", "B", "B"]),
+            "tissue":     ["blood", "blood", "blood"],
             "donor_id":  ["dB0", "dB1", "dB2"],
             "organism":  ["human", "human", "human"],
             "n_genes":   [15, 25, 35],
