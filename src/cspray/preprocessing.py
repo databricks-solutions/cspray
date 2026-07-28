@@ -12,6 +12,7 @@ import numpy as np
 
 from .utils import materialize
 from . import _pca
+from .metadata import _merge_sample_metadata
 
 def pca(sdata: SprayData, n_hvg:Optional[int]=None, n_components:Optional[int]=50):
     """
@@ -248,21 +249,24 @@ def calculate_qc_metrics(sdata: SprayData, mt_prepend='MT-'):
             materialize(cell_sdf)
 
 
-    sdata.sam = count_df.groupby('fp_int').agg(
+    sample_metrics = count_df.groupby('fp_int').agg(
         F.count('cell_idx').alias('n_cells'),
         F.sum('total_counts').alias('total_counts')
     )
     #  and mean genes per cell
-    sdata.sam = sdata.sam.join(
+    sample_metrics = sample_metrics.join(
         gene_bincount_df.groupby('fp_int').agg(
             F.mean(F.col('bin_gene_counts')).alias('mean_genes_per_cell')
         ),
         on='fp_int',
         how='left'
     )
-    
-    # Add file_path to sam (created via groupBy, so only has fp_int)
-    sdata.sam = sdata.sam.join(F.broadcast(sdata.file_mapping), on='fp_int', how='left')
+
+    # sam is created at read time. QC owns only its metric columns, so replacing
+    # those columns preserves user-provided and promoted sample metadata.
+    if sdata.sam is None:
+        sdata.sam = sdata.file_mapping
+    _merge_sample_metadata(sdata, sample_metrics, on='fp_int', if_exists='replace')
 
     
     sdata.obs = sdata.obs.join(

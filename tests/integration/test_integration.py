@@ -187,7 +187,13 @@ def test_metadata_dummy_roundtrip(dummy_h5ad_pair, spark_collect):
         metadata_variant=False, force_partitioning=2,
     )
 
-    # 1. every cell carries metadata, keyed to the right barcode ------------
+    # 1. sam exists immediately at one row per input file -------------------
+    sam = sdata.sam.toPandas()
+    assert len(sam) == 2
+    assert set(sam.columns) == {'fp_int', 'file_path'}
+    assert set(sam['file_path']) == set(dummy_h5ad_pair)
+
+    # 2. every cell carries metadata, keyed to the right barcode ------------
     obs = sdata.obs.select('cell_barcode', 'obs_data').toPandas()
     assert set(obs['cell_barcode']) == {'cA0','cA1','cA2','cB0','cB1','cB2'}
     parsed = {r.cell_barcode: json.loads(r.obs_data) for r in obs.itertuples()}
@@ -198,10 +204,11 @@ def test_metadata_dummy_roundtrip(dummy_h5ad_pair, spark_collect):
     assert 'batch' not in parsed['cA0']       # file A never had it
     assert 'CellType' not in parsed['cB0']    # file B never had it
 
-    # 2. profile: pick-up + coverage + classification -----------------------
+    # 3. profile: pick-up + coverage + classification -----------------------
     r = cs.md.profile(sdata, which='obs', max_categorical=3, verbose=False).set_index('key')
     assert set(r.index) == {
-        'cell_type','donor_id','organism','n_genes','qc_score','CellType','batch','mixed'}
+        'cell_type','tissue','donor_id','organism','n_genes','qc_score',
+        'CellType','batch','mixed'}
     assert r.loc['cell_type','coverage_pct'] == 100.0 and r.loc['cell_type','present'] == 6
     assert r.loc['batch','coverage_pct'] == 50.0 and r.loc['batch','tag'] == 'partial'
     assert r.loc['CellType','coverage_pct'] == 50.0
@@ -212,13 +219,13 @@ def test_metadata_dummy_roundtrip(dummy_h5ad_pair, spark_collect):
     assert bool(r.loc['cell_type','possible_alias']) and bool(r.loc['CellType','possible_alias'])
     assert bool(r.loc['mixed','type_conflict'])
 
-    # 3. per-file matrix -----------------------------------------------------
+    # 4. per-file matrix -----------------------------------------------------
     _, matrix = cs.md.profile(sdata, which='obs', per_file=True, verbose=False)
     assert matrix.shape[1] == 2
     assert set(matrix.loc['batch']) == {0.0, 100.0}
     assert (matrix.loc['cell_type'] == 100.0).all()
 
-    # 4. promote (string + typed) -------------------------------------------
+    # 5. promote (string + typed) -------------------------------------------
     cs.md.promote(sdata, 'cell_type', which='obs')
     cs.md.promote(sdata, 'n_genes', which='obs', dtypes='int')
     prom = sdata.obs.select('cell_barcode','cell_type','n_genes').toPandas().set_index('cell_barcode')
@@ -226,18 +233,111 @@ def test_metadata_dummy_roundtrip(dummy_h5ad_pair, spark_collect):
     assert int(prom.loc['cA1','n_genes']) == 20
     assert int(prom.loc['cB2','n_genes']) == 35
 
-    # 5. var side, briefly ---------------------------------------------------
+    # 6. var side, briefly ---------------------------------------------------
     vr = cs.md.profile(sdata, which='var', max_categorical=3, verbose=False).set_index('key')
     assert {'feature_type','highly_variable'}.issubset(set(vr.index))
     assert vr.loc['feature_type','suggested_action'] == 'drop_constant'
+
+
+def test_sample_metadata_promotion_and_qc_order(dummy_h5ad_pair, spark_collect):
+    """Sample metadata and QC independently enrich the read-time sam table."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False, mode='delta',
+        obs_metadata_columns='all', metadata_variant=False, force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+
+    plan = cs.md.promote_sample_suggested(sdata, dry_run=True, verbose=False)
+    assert set(plan.columns) == {'which', 'key', 'dtype', 'suggested_action'}
+    assert set(plan['which']) == {'sample'}
+    assert {'tissue', 'organism'}.issubset(set(plan['key']))
+    assert 'cell_type' not in set(plan['key'])
+    assert 'donor_id' not in set(plan['key'])
+
+    # If a sample-level key was previously promoted on obs, moving it to sam
+    # removes only that duplicated top-level column (the payload remains).
+    cs.md.promote(sdata, 'tissue', which='obs')
+    assert 'tissue' in sdata.obs.columns
+    cs.md.promote_sample_suggested(sdata, verbose=False)
+    sam = sdata.sam.select('file_path', 'tissue', 'organism').toPandas().set_index('file_path')
+    assert sam.loc[dummy_h5ad_pair[0], 'tissue'] == 'lung'
+    assert sam.loc[dummy_h5ad_pair[1], 'tissue'] == 'blood'
+    assert set(sam['organism']) == {'human'}
+    assert 'tissue' not in sdata.obs.columns
+    assert 'tissue' in json.loads(
+        sdata.obs.select('obs_data').limit(1).toPandas()['obs_data'].iloc[0]
+    )
+
+    cs.pp.calculate_qc_metrics(sdata)
+    assert {'tissue', 'organism', 'n_cells', 'total_counts',
+            'mean_genes_per_cell'}.issubset(set(sdata.sam.columns))
+
+    external = spark_collect.createDataFrame([
+        (dummy_h5ad_pair[0], 'study-a'),
+        (dummy_h5ad_pair[1], 'study-b'),
+    ], ['file_path', 'study'])
+    cs.md.add_sample_metadata(sdata, external)
+    assert set(sdata.sam.select('study').toPandas()['study']) == {'study-a', 'study-b'}
+
+
+def test_qc_before_sample_metadata_promotion(dummy_h5ad_pair, spark_collect):
+    """Promoting after QC preserves previously calculated sample metrics."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False, mode='delta',
+        obs_metadata_columns='all', metadata_variant=False, force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    cs.pp.calculate_qc_metrics(sdata)
+    cs.md.promote_sample(sdata, ['tissue'], dtypes='string')
+
+    assert {'tissue', 'n_cells', 'total_counts',
+            'mean_genes_per_cell'}.issubset(set(sdata.sam.columns))
+    assert set(sdata.sam.select('tissue').toPandas()['tissue']) == {'lung', 'blood'}
+
+
+def test_promote_suggested_with_promote_sam(dummy_h5ad_pair, spark_collect):
+    """promote_sam=True routes sample-constant keys to sam in the same call, and
+    keeps them out of the obs plan so nothing is materialized per cell."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False, mode='delta',
+        obs_metadata_columns='all', var_metadata_columns='all',
+        metadata_variant=False, force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+
+    plan = cs.md.promote_suggested(
+        sdata, which='both', profile_kwargs={'max_categorical': 3},
+        promote_sam=True, dry_run=True, verbose=False,
+    )
+    by_target = {w: set(g['key']) for w, g in plan.groupby('which')}
+    assert {'tissue', 'organism'}.issubset(by_target['sample'])
+    assert 'tissue' not in by_target['obs']       # excluded in favour of sam
+    assert 'cell_type' in by_target['obs']        # varies per cell, stays on obs
+    assert 'highly_variable' in by_target['var']
+
+    cs.md.promote_suggested(
+        sdata, which='both', profile_kwargs={'max_categorical': 3},
+        promote_sam=True, verbose=False,
+    )
+    assert 'cell_type' in sdata.obs.columns
+    assert 'tissue' not in sdata.obs.columns
+    sam = sdata.sam.select('file_path', 'tissue').toPandas().set_index('file_path')
+    assert sam.loc[dummy_h5ad_pair[0], 'tissue'] == 'lung'
+    assert sam.loc[dummy_h5ad_pair[1], 'tissue'] == 'blood'
+
+    with pytest.raises(ValueError):
+        cs.md.promote_suggested(sdata, which='obs', keys=['tissue'], promote_sam=True)
+
 
 def test_metadata_promote_suggested(dummy_h5ad_pair, spark_collect):
     """promote_suggested: dry_run returns an editable plan without mutating, and
     applying it materializes the recommended keys with inferred Spark types.
 
     max_categorical=3 (via profile_kwargs) makes the classification deterministic
-    at this tiny scale, so only cell_type (obs) and highly_variable (var) are
-    'promote'; organism is drop_constant and the unique/mixed keys keep_in_variant.
+    at this tiny scale, so cell_type and tissue (obs) and highly_variable (var)
+    are 'promote'; organism is drop_constant and the unique/mixed keys
+    keep_in_variant. tissue is sample-constant, so it is only an obs candidate
+    while promote_sam is off (see test_promote_suggested_with_promote_sam).
     """
     sdata = SprayData.from_h5ads(
         spark_collect, path=dummy_h5ad_pair, from_raw=False, mode='delta',
@@ -254,6 +354,7 @@ def test_metadata_promote_suggested(dummy_h5ad_pair, spark_collect):
     assert set(plan.columns) == {'which', 'key', 'dtype', 'suggested_action'}
     plan_keys = set(plan['key'])
     assert 'cell_type' in plan_keys        # promote
+    assert 'tissue' in plan_keys           # promote (sample-constant, but promote_sam off)
     assert 'organism' not in plan_keys     # drop_constant
     assert 'donor_id' not in plan_keys     # keep_in_variant (nd=6 > 3)
     assert plan.set_index('key').loc['cell_type', 'dtype'] == 'string'
