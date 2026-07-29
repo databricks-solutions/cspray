@@ -12,6 +12,7 @@ import numpy as np
 
 from .utils import materialize
 from . import _pca
+from .metadata import _merge_sample_metadata
 
 def pca(sdata: SprayData, n_hvg:Optional[int]=None, n_components:Optional[int]=50):
     """
@@ -72,15 +73,20 @@ def make_var_names_unique(sdata, remove_null_genes=True):
     print(f"Deduplicating gene_names...")
     
     # Deduplicate var
+    agg_exprs = [
+        F.min('gene_idx').alias('gene_idx'),
+        F.first('gene_id').alias('gene_id'), # exact mapping could change here but its not so important 
+        F.concat_ws('|', F.collect_set('original_provided_gene_name')).alias('original_provided_gene_name')
+    ]
+    # carry the variant/JSON metadata column through the dedup if present
+    # (groupBy would otherwise drop it); dedup is already lossy for genes so
+    # keeping the representative row's metadata is consistent with gene_id above
+    if 'var_data' in new_var.columns:
+        agg_exprs.append(F.first('var_data').alias('var_data'))
     new_var = (
         new_var
         .groupBy('fp_int', 'gene_name')
-        .agg(
-            F.min('gene_idx').alias('gene_idx'),
-            F.first('gene_id').alias('gene_id'), # exact mapping could change here but its not so important 
-            F.first('fp_int').alias('fp_int'),
-            F.concat_ws('|', F.collect_set('original_provided_gene_name')).alias('original_provided_gene_name')
-        )
+        .agg(*agg_exprs)
     ).repartition(sdata.var.rdd.getNumPartitions(), 'fp_int')
     
     # Add file_path back (lost in groupBy at line 77)
@@ -243,21 +249,24 @@ def calculate_qc_metrics(sdata: SprayData, mt_prepend='MT-'):
             materialize(cell_sdf)
 
 
-    sdata.sam = count_df.groupby('fp_int').agg(
+    sample_metrics = count_df.groupby('fp_int').agg(
         F.count('cell_idx').alias('n_cells'),
         F.sum('total_counts').alias('total_counts')
     )
     #  and mean genes per cell
-    sdata.sam = sdata.sam.join(
+    sample_metrics = sample_metrics.join(
         gene_bincount_df.groupby('fp_int').agg(
             F.mean(F.col('bin_gene_counts')).alias('mean_genes_per_cell')
         ),
         on='fp_int',
         how='left'
     )
-    
-    # Add file_path to sam (created via groupBy, so only has fp_int)
-    sdata.sam = sdata.sam.join(F.broadcast(sdata.file_mapping), on='fp_int', how='left')
+
+    # sam is created at read time. QC owns only its metric columns, so replacing
+    # those columns preserves user-provided and promoted sample metadata.
+    if sdata.sam is None:
+        sdata.sam = sdata.file_mapping
+    _merge_sample_metadata(sdata, sample_metrics, on='fp_int', if_exists='replace')
 
     
     sdata.obs = sdata.obs.join(
