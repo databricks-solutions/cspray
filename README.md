@@ -44,7 +44,7 @@ to see all options:
 ~: python examples/single_run_example.py --help
 ```
 
-Additionally for Databricks users there are some example notebooks and we expect to extend these offerings.
+Additionally for Databricks users there are some example notebooks and we expect to extend these offerings. See `databricks/README.md` for those notebooks and for guidance on choosing and configuring compute.
 
 ## About
 

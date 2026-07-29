@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cspray"
-version = "1.0.3"
+version = "1.1.0"
 authors = [{name = "Peter Hawkins", email = "peter.hawkins@databricks.com"}]
 description = "Cell SPRAY"
 dependencies = [
