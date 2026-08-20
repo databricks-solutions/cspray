@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from cspray.data import SprayData
+from cspray.read import _explode_nnz_ranges
 import cspray as cs
 
 # --- metadata round-trip comparison helpers --------------------------------
@@ -375,6 +376,56 @@ def test_metadata_promote_suggested(dummy_h5ad_pair, spark_collect):
     # --- guard: keys override not allowed with which='both' ----------------
     with pytest.raises(ValueError):
         cs.md.promote_suggested(sdata, which='both', keys=['cell_type'])
+
+@pytest.mark.parametrize("nnz,chunk_size", [
+    (0, 4),
+    (12, 1),
+    (12, 4),
+    (12, 5),
+    (12, 12),
+    (30_000_000, 30_000_000),
+])
+def test_explode_nnz_ranges_never_starts_at_nnz(spark_collect, nnz, chunk_size):
+    """sequence stop must be nnz-1 so a multiple of chunk_size does not emit
+    start_idx == nnz (that chunk IndexErrors in the CSR slice).
+    """
+    sdf = spark_collect.createDataFrame([(nnz,)], ["maxsize"])
+    rows = _explode_nnz_ranges(sdf, "maxsize", chunk_size, None).collect()
+    if nnz == 0:
+        assert rows == []
+        return
+    starts = [r.start_idx for r in rows]
+    ends = [r.end_idx for r in rows]
+    assert min(starts) == 0
+    assert max(ends) == nnz - 1
+    assert all(s < nnz for s in starts)
+    assert all(s <= e for s, e in zip(starts, ends))
+    if nnz <= 12:
+        covered = [i for s, e in zip(starts, ends) for i in range(s, e + 1)]
+        assert covered == list(range(nnz))
+
+@pytest.mark.parametrize("chunk_size", [1, 4, 5, 12])
+def test_expression_chunk_boundary(dummy_h5ad_categorical_index, spark_collect, chunk_size):
+    """3x4 dense CSR → nnz=12. chunk_size 1/4/12 divide nnz exactly and used
+    to emit a start_idx==nnz chunk. 5 does not divide 12 (control).
+    """
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_categorical_index, from_raw=False,
+        mode='delta', force_partitioning=1, chunk_size=chunk_size,
+    )
+    assert sdata.X.count() == 12
+    assert sdata.obs.count() == 3
+    assert sdata.var.count() == 4
+
+def test_expression_empty_x(dummy_h5ad_empty_x, spark_collect):
+    """nnz == 0 must ingest obs/var and produce an empty X, not IndexError."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_empty_x, from_raw=False,
+        mode='delta', force_partitioning=1, chunk_size=4,
+    )
+    assert sdata.X.count() == 0
+    assert sdata.obs.count() == 3
+    assert sdata.var.count() == 4
 
 def test_categorical_index_row_count(dummy_h5ad_categorical_index, spark_collect):
     """Regression: obs whose index is categorical is stored as an h5py group, so

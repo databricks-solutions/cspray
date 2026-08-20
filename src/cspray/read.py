@@ -255,6 +255,31 @@ def _explode_row_ranges(sdf, count_col: str, chunk_size: Optional[int], force_pa
         sdf = sdf.withColumn('id', F.monotonically_increasing_id()).repartition(force_partitioning)
     return sdf
 
+def _explode_nnz_ranges(sdf, count_col: str, chunk_size: int, force_partitioning: Optional[int]):
+    """Explode per-file nnz into inclusive (start_idx, end_idx) CSR data ranges.
+
+    Valid data indices are ``0 .. nnz-1``. Spark ``sequence`` is inclusive of
+    stop, so stop must be ``nnz - 1``: ``sequence(0, nnz, chunk_size)`` emits a
+    final chunk with ``start_idx == nnz`` whenever ``nnz % chunk_size == 0``,
+    and ``get_csr_submatrix_from_raw`` then raises IndexError.
+
+    Files with ``nnz == 0`` are dropped (no chunks) rather than sequencing to
+    ``-1``.
+    """
+    sdf = sdf.filter(F.col(count_col) > 0)
+    sdf = sdf.withColumn(
+        'starts',
+        F.sequence(F.lit(0), F.col(count_col) - 1, F.lit(chunk_size)),
+    )
+    sdf = sdf.withColumn('start_idx', F.explode('starts')).drop('starts')
+    sdf = sdf.withColumn(
+        'end_idx',
+        F.least(F.col(count_col) - 1, F.col('start_idx') + F.lit(chunk_size) - 1),
+    )
+    if force_partitioning:
+        sdf = sdf.withColumn('id', F.monotonically_increasing_id()).repartition(force_partitioning)
+    return sdf
+
 def coo_subarr_to_arrmap(coo_chunk):
     arr_out = [{
         'row_idx': int(coo_chunk.row[i]),
@@ -665,16 +690,7 @@ def read_expression_from_h5ads(
     else:
         sdf = df.withColumn('maxsize', udf_get_default_maxsize(F.col('file_path')))
 
-    sdf = sdf.withColumn('indices', F.sequence(F.lit(0), F.col('maxsize'), F.lit(chunk_size)))
-    sdf = sdf.withColumn('start_idx', F.explode('indices'))
-    if force_partitioning:
-        sdf = sdf.withColumn("id", F.monotonically_increasing_id()).repartition(force_partitioning)
-    sdf = sdf.withColumn(
-        'end_idx', 
-        F.least(F.col('maxsize'),F.col('start_idx')+F.lit(chunk_size-1))
-    ).drop(
-        'indices'
-    )
+    sdf = _explode_nnz_ranges(sdf, 'maxsize', chunk_size, force_partitioning)
     sdf = sdf.select('file_path','fp_int','start_idx','end_idx')\
         .mapInArrow(
             lambda x: mapinarrow_process_float_expression_h5ad(x, from_raw=from_raw, fallback_default=fallback_default),
