@@ -10,6 +10,7 @@ import pandas as pd
 from cspray.data import SprayData
 from cspray.read import _explode_nnz_ranges, construct_h5ad_path_df
 import cspray as cs
+from pyspark.sql import functions as F
 
 # --- metadata round-trip comparison helpers --------------------------------
 # The obs/var metadata payload is serialized to JSON (VARIANT/string), which is
@@ -465,6 +466,34 @@ def test_listing_path_and_df_rejected(dummy_h5ad_categorical_index, spark_collec
         construct_h5ad_path_df(
             path=dummy_h5ad_categorical_index, df=incoming, spark=spark_collect
         )
+
+def test_sam_from_listing_not_obs(dummy_h5ad_pair, spark_collect):
+    """sam is one row per file from the listing, not distinct obs cells."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    assert set(sdata.sam.columns) == {'fp_int', 'file_path'}
+    sam = sdata.sam.toPandas()
+    assert len(sam) == 2
+    assert set(sam['file_path']) == set(dummy_h5ad_pair)
+    assert sdata.obs.count() == 6
+    x_ids = {r.fp_int for r in sdata.X.select('fp_int').distinct().collect()}
+    assert x_ids == set(sam['fp_int'])
+
+def test_injected_fp_int_used_everywhere(dummy_h5ad_categorical_index, spark_collect):
+    """If the listing already has fp_int, do not re-hash; X/obs/var/sam all use it."""
+    listing = construct_h5ad_path_df(
+        path=dummy_h5ad_categorical_index, spark=spark_collect
+    ).withColumn('fp_int', F.lit(42).cast('int'))
+    sdata = SprayData.from_h5ads(
+        spark_collect, df=listing, from_raw=False,
+        mode='delta', force_partitioning=1,
+    )
+    assert sdata.sam.collect()[0].fp_int == 42
+    assert {r.fp_int for r in sdata.X.select('fp_int').distinct().collect()} == {42}
+    assert {r.fp_int for r in sdata.obs.select('fp_int').distinct().collect()} == {42}
+    assert {r.fp_int for r in sdata.var.select('fp_int').distinct().collect()} == {42}
 
 def test_expression_empty_x(dummy_h5ad_empty_x, spark_collect):
     """nnz == 0 must ingest obs/var and produce an empty X, not IndexError."""

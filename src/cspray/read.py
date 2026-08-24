@@ -670,6 +670,16 @@ def construct_h5ad_path_df(
         )
     return df
 
+def ensure_fp_int(df: pyspark.sql.DataFrame) -> pyspark.sql.DataFrame:
+    """Add fp_int = hash(file_path) unless the listing already carries it."""
+    if 'fp_int' not in df.columns:
+        df = df.withColumn('fp_int', F.hash('file_path'))
+    return df
+
+def _file_identity_df(df: pyspark.sql.DataFrame) -> pyspark.sql.DataFrame:
+    """Skinny (file_path, fp_int) used by the readers. Drops listing extras."""
+    return ensure_fp_int(df).select('file_path', 'fp_int').distinct()
+
 def read_expression_from_h5ads(
     spark:pyspark.sql.session.SparkSession,
     path:Optional[Union[List,str]]=None, 
@@ -704,11 +714,8 @@ def read_expression_from_h5ads(
     pyspark.sql.DataFrame
         DataFrame containing expression data with columns: file_path, fp_int, cell_idx, gene_idx, expression.
     """
-    df = construct_h5ad_path_df(path,df,spark)
+    df = _file_identity_df(construct_h5ad_path_df(path,df,spark))
     h5ad_format_check(df, from_raw, fallback_default)
-    
-    df = df.select('file_path').distinct()
-    df = df.withColumn('fp_int', F.hash('file_path'))
 
     # get the file size 
     # - use raw group if requested or eslse default groups
@@ -790,10 +797,7 @@ def read_var_from_h5ads(
         DataFrame containing gene metadata with columns: file_path, fp_int,
         gene_idx, gene_id, gene_name, and (when metadata_columns is set) var_data.
     """
-    df = construct_h5ad_path_df(path,df,spark)
-    
-    df = df.select('file_path').distinct()
-    df = df.withColumn('fp_int', F.hash('file_path'))
+    df = _file_identity_df(construct_h5ad_path_df(path,df,spark))
 
     # explode each file into (start_idx, end_idx) gene ranges (whole-file when chunk size unset)
     ranged = df.withColumn('n_var', make_n_var_udf(from_raw, fallback_default)(F.col('file_path')))
@@ -917,10 +921,7 @@ def read_obs_from_h5ads(
         DataFrame containing cell metadata with columns: file_path, fp_int,
         cell_idx, cell_barcode, and (when metadata_columns is set) obs_data.
     """
-    df = construct_h5ad_path_df(path,df,spark)
-    
-    df = df.select('file_path').distinct()
-    df = df.withColumn('fp_int', F.hash('file_path'))
+    df = _file_identity_df(construct_h5ad_path_df(path,df,spark))
 
     # explode each file into (start_idx, end_idx) cell ranges (whole-file when chunk size unset)
     ranged = df.withColumn('n_obs', udf_get_n_obs(F.col('file_path')))
