@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from cspray.data import SprayData
-from cspray.read import _explode_nnz_ranges
+from cspray.read import _explode_nnz_ranges, construct_h5ad_path_df
 import cspray as cs
 
 # --- metadata round-trip comparison helpers --------------------------------
@@ -416,6 +416,55 @@ def test_expression_chunk_boundary(dummy_h5ad_categorical_index, spark_collect, 
     assert sdata.X.count() == 12
     assert sdata.obs.count() == 3
     assert sdata.var.count() == 4
+
+def _assert_listing_matches_stat(row, path):
+    st = os.stat(path)
+    assert row.file_path == path
+    assert row.source_length == st.st_size
+    assert abs(row.source_modified - st.st_mtime) < 1e-3
+
+def test_listing_single_file(dummy_h5ad_categorical_index, spark_collect):
+    sdf = construct_h5ad_path_df(path=dummy_h5ad_categorical_index, spark=spark_collect)
+    assert set(sdf.columns) == {'file_path', 'source_length', 'source_modified'}
+    rows = sdf.collect()
+    assert len(rows) == 1
+    _assert_listing_matches_stat(rows[0], dummy_h5ad_categorical_index)
+
+def test_listing_path_list(dummy_h5ad_pair, spark_collect):
+    sdf = construct_h5ad_path_df(path=dummy_h5ad_pair, spark=spark_collect)
+    got = {r.file_path: r for r in sdf.collect()}
+    assert set(got) == set(dummy_h5ad_pair)
+    for p in dummy_h5ad_pair:
+        _assert_listing_matches_stat(got[p], p)
+
+def test_listing_directory(dummy_h5ad_pair, spark_collect, tmp_path):
+    for src in dummy_h5ad_pair:
+        os.symlink(src, tmp_path / os.path.basename(src))
+    (tmp_path / 'ignore.txt').write_text('not an h5ad')
+    sdf = construct_h5ad_path_df(path=str(tmp_path), spark=spark_collect)
+    rows = sdf.collect()
+    assert len(rows) == 2
+    got_names = {os.path.basename(r.file_path) for r in rows}
+    assert got_names == {os.path.basename(p) for p in dummy_h5ad_pair}
+    for r in rows:
+        _assert_listing_matches_stat(r, r.file_path)
+
+def test_listing_df_passthrough(dummy_h5ad_categorical_index, spark_collect):
+    incoming = spark_collect.createDataFrame(
+        [(dummy_h5ad_categorical_index,)], ['file_path']
+    )
+    out = construct_h5ad_path_df(df=incoming, spark=spark_collect)
+    assert out.columns == incoming.columns
+    assert [r.file_path for r in out.collect()] == [dummy_h5ad_categorical_index]
+
+def test_listing_path_and_df_rejected(dummy_h5ad_categorical_index, spark_collect):
+    incoming = spark_collect.createDataFrame(
+        [(dummy_h5ad_categorical_index,)], ['file_path']
+    )
+    with pytest.raises(ValueError, match='only path or df'):
+        construct_h5ad_path_df(
+            path=dummy_h5ad_categorical_index, df=incoming, spark=spark_collect
+        )
 
 def test_expression_empty_x(dummy_h5ad_empty_x, spark_collect):
     """nnz == 0 must ingest obs/var and produce an empty X, not IndexError."""

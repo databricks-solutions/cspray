@@ -598,6 +598,35 @@ def mapinarrow_var_from_h5ad(itr: Iterator, gene_name_column:Optional[str]=None,
 
             yield pa.RecordBatch.from_pydict(record, schema=_gene_pa_schema(include_meta))
 
+_H5AD_LISTING_SCHEMA = T.StructType([
+    T.StructField('file_path', T.StringType(), False),
+    T.StructField('source_length', T.LongType(), False),
+    T.StructField('source_modified', T.DoubleType(), False),
+])
+
+def _h5ad_listing_row(file_path: str) -> dict:
+    """One listing row from os.stat. Signature comes from the filesystem, not h5py."""
+    st = os.stat(file_path)
+    return {
+        'file_path': file_path,
+        'source_length': int(st.st_size),
+        'source_modified': float(st.st_mtime),
+    }
+
+def _list_h5ad_dir(directory: str) -> List[dict]:
+    """h5ad files in a directory via scandir (size + mtime in the same pass)."""
+    rows = []
+    with os.scandir(directory) as it:
+        for entry in it:
+            if entry.is_file() and entry.name.endswith('.h5ad'):
+                st = entry.stat()
+                rows.append({
+                    'file_path': entry.path,
+                    'source_length': int(st.st_size),
+                    'source_modified': float(st.st_mtime),
+                })
+    return rows
+
 def construct_h5ad_path_df(
     path:Optional[Union[List,str]]=None, 
     df:Optional[pyspark.sql.DataFrame]=None, 
@@ -612,28 +641,33 @@ def construct_h5ad_path_df(
         Directory containing h5ad files, a single h5ad file path (could be globbed with *), or a list of h5ad file paths.
     df : pyspark.sql.DataFrame, optional
         Existing DataFrame containing file paths. If provided, 'path' must be None.
+        Passed through unchanged so a caller can inject their own listing.
     spark : SparkSession, optional
         Spark session used to create DataFrame from file paths.
 
     Returns
     -------
     pyspark.sql.DataFrame
-        DataFrame with a 'file_path' column containing h5ad file paths.
+        When built from ``path``: ``file_path``, ``source_length`` (bytes),
+        ``source_modified`` (unix mtime). When ``df`` is passed, that frame
+        is returned as-is.
     """
     if path is not None:
-        if df is None:
-            if isinstance(path, str):
-                if not path.endswith('.h5ad'): # assume directory
-                    df = pd.DataFrame({'file_path': [os.path.join(path, f) for f in os.listdir(path) if f.endswith('.h5ad')]})
-                else: # sigle h5ad file
-                    df = pd.DataFrame({'file_path': [path]})
-            elif isinstance(path, list):
-                df = pd.DataFrame({'file_path': path})
-            else:
-                raise ValueError("path must be a string or a list of strings")
-            df = spark.createDataFrame(df)
-        else:
+        if df is not None:
             raise ValueError("provide only path or df, not both")
+        if isinstance(path, str):
+            if path.endswith('.h5ad'):
+                rows = [_h5ad_listing_row(path)]
+            else:
+                rows = _list_h5ad_dir(path)
+        elif isinstance(path, list):
+            rows = [_h5ad_listing_row(p) for p in path]
+        else:
+            raise ValueError("path must be a string or a list of strings")
+        return spark.createDataFrame(
+            [(r['file_path'], r['source_length'], r['source_modified']) for r in rows],
+            schema=_H5AD_LISTING_SCHEMA,
+        )
     return df
 
 def read_expression_from_h5ads(
