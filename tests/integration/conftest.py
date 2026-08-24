@@ -131,7 +131,7 @@ def dummy_h5ad_categorical_index():
         index=pd.CategoricalIndex(["cA0", "cA1", "cA2"], name="barcode"),
     )
     adata = ad.AnnData(
-        X=csr_matrix(np.arange(12, dtype="float32").reshape(3, 4)),
+        X=csr_matrix(np.arange(1, 13, dtype="float32").reshape(3, 4)),
         obs=obs,
         var=pd.DataFrame(
             {"feature_type": ["gene"] * 4},
@@ -144,6 +144,26 @@ def dummy_h5ad_categorical_index():
 
     yield f.name
 
+    os.remove(f.name)
+
+@pytest.fixture(scope="module")
+def dummy_h5ad_empty_x():
+    """A CSR h5ad with cells/genes but zero stored values (nnz == 0).
+
+    Guards the expression-chunk path: sequence stop is nnz-1, so nnz == 0
+    must not emit a chunk (and must not crash).
+    """
+    import anndata as ad
+    from scipy.sparse import csr_matrix
+
+    adata = ad.AnnData(
+        X=csr_matrix((3, 4), dtype="float32"),
+        obs=pd.DataFrame(index=["c0", "c1", "c2"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2", "g3"]),
+    )
+    f = tempfile.NamedTemporaryFile(delete=False, suffix=".h5ad")
+    adata.write(f.name)
+    yield f.name
     os.remove(f.name)
 
 @pytest.fixture(scope="module")

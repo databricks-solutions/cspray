@@ -72,6 +72,7 @@ class SprayData:
         self.sam = sam
         self.clu = clu
         self.sta = sta
+        self.uns = uns
         self._file_mapping = None  # Cache for lazy loading
         self.write_order = [
             'X','var','obs','sam','clu','sta'
