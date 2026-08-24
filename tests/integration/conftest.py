@@ -131,7 +131,7 @@ def dummy_h5ad_categorical_index():
         index=pd.CategoricalIndex(["cA0", "cA1", "cA2"], name="barcode"),
     )
     adata = ad.AnnData(
-        X=csr_matrix(np.arange(12, dtype="float32").reshape(3, 4)),
+        X=csr_matrix(np.arange(1, 13, dtype="float32").reshape(3, 4)),
         obs=obs,
         var=pd.DataFrame(
             {"feature_type": ["gene"] * 4},
