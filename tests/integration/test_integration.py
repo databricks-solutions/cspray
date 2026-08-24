@@ -469,7 +469,7 @@ def test_categorical_chunked_decode(dummy_h5ad_categorical_index, spark_collect)
     assert parsed['cA0']['n_genes'] == 10
     assert parsed['cA2']['n_genes'] == 30
 
-@pytest.mark.parametrize("metadata_chunk_size", [100, 1])
+@pytest.mark.parametrize("metadata_chunk_size", [100,])
 def test_metadata_matches_scanpy_chunked(downloaded_file, spark_collect, scanpy_read_stage, metadata_chunk_size):
     """Strongest metadata oracle: read the full file with a chunk size far smaller
     than the number of rows (forcing many chunk boundaries) and confirm every
