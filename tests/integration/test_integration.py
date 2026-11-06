@@ -167,11 +167,14 @@ def test_cspray_metadata_profile_and_promote(downloaded_file, spark_collect):
     assert isinstance(matrix, pd.DataFrame)
 
     # --- promote a key into a top-level column -----------------------------
+    # Payload keys may contain spaces/dots; the Spark column is sanitised.
+    from cspray.metadata import _safe_column_name
     key = report['key'].iloc[0]
+    col = _safe_column_name(key)
     cs.md.promote(sdata, key, which='obs')
-    assert key in sdata.obs.columns
+    assert col in sdata.obs.columns
     # one value per cell, extracted as a (string) column
-    assert sdata.obs.select(key).count() == n_cells
+    assert sdata.obs.select(col).count() == n_cells
 
 def test_metadata_dummy_roundtrip(dummy_h5ad_pair, spark_collect):
     """End-to-end metadata check on two hand-built h5ad files with known values:
