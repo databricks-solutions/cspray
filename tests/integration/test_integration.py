@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from cspray.data import SprayData
-from cspray.read import _explode_nnz_ranges, construct_h5ad_path_df
+from cspray.read import _explode_nnz_ranges, construct_h5ad_path_df, inspect_h5ads
 import cspray as cs
 from pyspark.sql import functions as F
 
@@ -494,6 +494,40 @@ def test_injected_fp_int_used_everywhere(dummy_h5ad_categorical_index, spark_col
     assert {r.fp_int for r in sdata.X.select('fp_int').distinct().collect()} == {42}
     assert {r.fp_int for r in sdata.obs.select('fp_int').distinct().collect()} == {42}
     assert {r.fp_int for r in sdata.var.select('fp_int').distinct().collect()} == {42}
+
+def test_inspect_maxsize_matches_h5py(dummy_h5ad_categorical_index, spark_collect):
+    """Inspect nnz equals the on-disk CSR data length (categorical dummy nnz=12)."""
+    import h5py
+    listing = construct_h5ad_path_df(
+        path=dummy_h5ad_categorical_index, spark=spark_collect
+    )
+    row = inspect_h5ads(listing, spark_collect, force_partitioning=1).collect()[0]
+    with h5py.File(dummy_h5ad_categorical_index, 'r') as f:
+        assert row.maxsize_main == f['X']['data'].shape[0]
+        assert row.dtype_main == str(f['X']['data'].dtype)
+    assert row.maxsize_main == 12
+    assert row.main_csr
+    assert not row.has_raw
+
+def test_inspect_empty_x_maxsize(dummy_h5ad_empty_x, spark_collect):
+    listing = construct_h5ad_path_df(path=dummy_h5ad_empty_x, spark=spark_collect)
+    row = inspect_h5ads(listing, spark_collect, force_partitioning=1).collect()[0]
+    assert row.maxsize_main == 0
+    assert row.main_csr
+
+def test_inspect_dtype_present(dummy_h5ad_categorical_index, spark_collect):
+    listing = construct_h5ad_path_df(
+        path=dummy_h5ad_categorical_index, spark=spark_collect
+    )
+    row = inspect_h5ads(listing, spark_collect, force_partitioning=1).collect()[0]
+    assert row.dtype_main == 'float32'
+
+def test_dense_h5ad_rejected(dummy_h5ad_dense, spark_collect):
+    with pytest.raises(ValueError, match='default X with a CSR format'):
+        SprayData.from_h5ads(
+            spark_collect, path=dummy_h5ad_dense, from_raw=False,
+            mode='delta', force_partitioning=1,
+        )
 
 def test_expression_empty_x(dummy_h5ad_empty_x, spark_collect):
     """nnz == 0 must ingest obs/var and produce an empty X, not IndexError."""

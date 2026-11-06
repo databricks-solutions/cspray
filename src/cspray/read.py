@@ -10,9 +10,7 @@ import copy
 import pyarrow as pa
 import logging
 import os
-import warnings
 
-from .utils import h5ad_format_check
 
 expstruct_wfile_intfn = T.StructType([
     T.StructField("fp_int", T.IntegerType(), False),
@@ -170,25 +168,6 @@ DEFAULT_READERS = {
 }
 
 
-
-@F.udf(returnType=T.LongType())
-def udf_get_default_maxsize(path):
-    file = h5py.File(path, 'r') 
-    try:
-        size = file['X']['data'].shape[0]
-    except:
-        warnings.warn('default read failing (ie from X in h5ad) - assuming raw was used and thats why default is failing and you`ll be ok bc you`re using raw')
-        # X doesn't exist or is some empty structure - this shoudl not happen unless data in raw anyway
-        return 0
-    return size
-
-@F.udf(returnType=T.LongType())
-def udf_get_raw_maxsize(path):
-    file = h5py.File(path, 'r') 
-    if 'raw' not in file.keys():
-        return 0
-    size = file['raw']['X']['data'].shape[0]
-    return size
 
 def _index_n_rows(group):
     """Number of rows in an h5ad obs/var group, from its index element.
@@ -680,6 +659,138 @@ def _file_identity_df(df: pyspark.sql.DataFrame) -> pyspark.sql.DataFrame:
     """Skinny (file_path, fp_int) used by the readers. Drops listing extras."""
     return ensure_fp_int(df).select('file_path', 'fp_int').distinct()
 
+_INSPECT_SCHEMA = T.StructType([
+    T.StructField('file_path', T.StringType(), False),
+    T.StructField('has_raw', T.BooleanType(), False),
+    T.StructField('main_csr', T.BooleanType(), False),
+    T.StructField('raw_csr', T.BooleanType(), False),
+    T.StructField('fallback_ok', T.BooleanType(), False),
+    T.StructField('maxsize_main', T.LongType(), False),
+    T.StructField('maxsize_raw', T.LongType(), False),
+    T.StructField('dtype_main', T.StringType(), True),
+    T.StructField('dtype_raw', T.StringType(), True),
+    T.StructField('obsm_keys', T.ArrayType(T.StringType()), False),
+])
+
+def _csr_nnz_and_dtype(group):
+    """nnz and numpy dtype string for a CSR X group; (0, None) if not CSR-shaped."""
+    try:
+        data = group['data']
+        return int(data.shape[0]), str(data.dtype)
+    except Exception:
+        return 0, None
+
+def _inspect_one(file_path: str) -> dict:
+    """Open one h5ad once: format flags, nnz, dtype, obsm key names."""
+    with h5py.File(file_path, 'r') as f:
+        has_x = 'X' in f
+        main_csr = bool(
+            has_x and f['X'].attrs.get('encoding-type') == 'csr_matrix'
+        )
+        has_raw = 'raw' in f
+        raw_csr = bool(
+            has_raw and f['raw']['X'].attrs.get('encoding-type') == 'csr_matrix'
+        )
+        fallback_ok = raw_csr or ((not has_raw) and main_csr)
+        maxsize_main, dtype_main = _csr_nnz_and_dtype(f['X']) if has_x else (0, None)
+        maxsize_raw, dtype_raw = (
+            _csr_nnz_and_dtype(f['raw']['X']) if has_raw else (0, None)
+        )
+        obsm_keys = [str(k) for k in f['obsm'].keys()] if 'obsm' in f else []
+    return {
+        'file_path': file_path,
+        'has_raw': has_raw,
+        'main_csr': main_csr,
+        'raw_csr': raw_csr,
+        'fallback_ok': fallback_ok,
+        'maxsize_main': maxsize_main,
+        'maxsize_raw': maxsize_raw,
+        'dtype_main': dtype_main,
+        'dtype_raw': dtype_raw,
+        'obsm_keys': obsm_keys,
+    }
+
+def _empty_inspect_pdf():
+    return pd.DataFrame({
+        'file_path': pd.Series(dtype='object'),
+        'has_raw': pd.Series(dtype='bool'),
+        'main_csr': pd.Series(dtype='bool'),
+        'raw_csr': pd.Series(dtype='bool'),
+        'fallback_ok': pd.Series(dtype='bool'),
+        'maxsize_main': pd.Series(dtype='int64'),
+        'maxsize_raw': pd.Series(dtype='int64'),
+        'dtype_main': pd.Series(dtype='object'),
+        'dtype_raw': pd.Series(dtype='object'),
+        'obsm_keys': pd.Series(dtype='object'),
+    })
+
+def _inspect_h5ad_partition(pdf_iter):
+    cols = [f.name for f in _INSPECT_SCHEMA]
+    for pdf in pdf_iter:
+        records = [_inspect_one(p) for p in pdf['file_path'].tolist()]
+        yield pd.DataFrame.from_records(records, columns=cols) if records else _empty_inspect_pdf()
+
+def inspect_h5ads(
+    df: pyspark.sql.DataFrame,
+    spark: pyspark.sql.session.SparkSession,
+    force_partitioning: Optional[int] = None,
+) -> pyspark.sql.DataFrame:
+    """Distributed per-file h5ad inspect. One open per path, not on the driver.
+
+    Returns format flags, main/raw nnz and dtypes, and obsm key names.
+    Repartitions first so a pandas-created listing is not a single fat task.
+    """
+    n = force_partitioning or spark.sparkContext.defaultParallelism
+    return (
+        df.select('file_path')
+        .distinct()
+        .repartition(n)
+        .mapInPandas(_inspect_h5ad_partition, schema=_INSPECT_SCHEMA)
+    )
+
+def _assert_csr_format(inspected, from_raw: bool, fallback_default: bool) -> None:
+    """Same raise/skip rules as the old driver-side format check."""
+    if from_raw:
+        if fallback_default:
+            bad = inspected.filter(~F.col('fallback_ok'))
+            prefix = (
+                "at least one file has an X in main thats falling back to from raw "
+                "without a CSR format (CSC on Roadmap) ;  bad files: "
+            )
+        else:
+            bad = inspected.filter(~(F.col('has_raw') & F.col('raw_csr')))
+            prefix = (
+                "Not all h5ad files have a raw group with a CSR format (CSC on Roadmap). "
+                "Can try fallback_default=False to use the raw data instead on files ; bad files: "
+            )
+    else:
+        bad = inspected.filter(~F.col('main_csr'))
+        prefix = (
+            "Not all h5ad files have a default X with a CSR format (CSC on Roadmap). "
+            "Can try from_raw=True to use the raw data instead on files ; bad files: "
+        )
+    paths = [r.file_path for r in bad.select('file_path').collect()]
+    if paths:
+        raise ValueError(prefix + str(paths))
+
+def _with_read_maxsize(inspected, from_raw: bool, fallback_default: bool):
+    """Pick nnz/dtype for the matrix this run will actually read."""
+    if from_raw:
+        if fallback_default:
+            return inspected.withColumn(
+                'maxsize',
+                F.when(F.col('maxsize_raw') == 0, F.col('maxsize_main')).otherwise(F.col('maxsize_raw')),
+            ).withColumn(
+                'expr_dtype',
+                F.when(F.col('maxsize_raw') == 0, F.col('dtype_main')).otherwise(F.col('dtype_raw')),
+            )
+        return inspected.withColumn('maxsize', F.col('maxsize_raw')).withColumn(
+            'expr_dtype', F.col('dtype_raw')
+        )
+    return inspected.withColumn('maxsize', F.col('maxsize_main')).withColumn(
+        'expr_dtype', F.col('dtype_main')
+    )
+
 def read_expression_from_h5ads(
     spark:pyspark.sql.session.SparkSession,
     path:Optional[Union[List,str]]=None, 
@@ -715,21 +826,10 @@ def read_expression_from_h5ads(
         DataFrame containing expression data with columns: file_path, fp_int, cell_idx, gene_idx, expression.
     """
     df = _file_identity_df(construct_h5ad_path_df(path,df,spark))
-    h5ad_format_check(df, from_raw, fallback_default)
-
-    # get the file size 
-    # - use raw group if requested or eslse default groups
-    # - use default group if fallback_default is True and from_raw is true
-    # suggest only using raw or not raw for all files and doing upstream processing as required
-    if from_raw:
-        sdf = df.withColumn('raw_maxsize', udf_get_raw_maxsize(F.col('file_path')))
-        if fallback_default:
-            sdf = sdf.withColumn('default_maxsize', udf_get_default_maxsize(F.col('file_path')))
-            sdf = sdf.withColumn('maxsize', F.when(F.col('raw_maxsize') == 0, F.col('default_maxsize')).otherwise(F.col('raw_maxsize')))
-        else:
-            sdf = sdf.withColumn('maxsize', F.col('raw_maxsize'))
-    else:
-        sdf = df.withColumn('maxsize', udf_get_default_maxsize(F.col('file_path')))
+    inspected = inspect_h5ads(df, spark, force_partitioning).cache()
+    _assert_csr_format(inspected, from_raw, fallback_default)
+    sdf = df.join(inspected, on='file_path', how='left')
+    sdf = _with_read_maxsize(sdf, from_raw, fallback_default)
 
     sdf = _explode_nnz_ranges(sdf, 'maxsize', chunk_size, force_partitioning)
     sdf = sdf.select('file_path','fp_int','start_idx','end_idx')\
