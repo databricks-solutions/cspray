@@ -8,8 +8,9 @@ import numpy as np
 import pandas as pd
 
 from cspray.data import SprayData
-from cspray.read import _explode_nnz_ranges
+from cspray.read import _explode_nnz_ranges, construct_h5ad_path_df, inspect_h5ads
 import cspray as cs
+from pyspark.sql import functions as F
 
 # --- metadata round-trip comparison helpers --------------------------------
 # The obs/var metadata payload is serialized to JSON (VARIANT/string), which is
@@ -495,6 +496,117 @@ def test_expression_chunk_boundary(dummy_h5ad_categorical_index, spark_collect, 
     assert sdata.X.count() == 12
     assert sdata.obs.count() == 3
     assert sdata.var.count() == 4
+
+def _assert_listing_matches_stat(row, path):
+    st = os.stat(path)
+    assert row.file_path == path
+    assert row.source_length == st.st_size
+    assert abs(row.source_modified - st.st_mtime) < 1e-3
+
+def test_listing_single_file(dummy_h5ad_categorical_index, spark_collect):
+    sdf = construct_h5ad_path_df(path=dummy_h5ad_categorical_index, spark=spark_collect)
+    assert set(sdf.columns) == {'file_path', 'source_length', 'source_modified'}
+    rows = sdf.collect()
+    assert len(rows) == 1
+    _assert_listing_matches_stat(rows[0], dummy_h5ad_categorical_index)
+
+def test_listing_path_list(dummy_h5ad_pair, spark_collect):
+    sdf = construct_h5ad_path_df(path=dummy_h5ad_pair, spark=spark_collect)
+    got = {r.file_path: r for r in sdf.collect()}
+    assert set(got) == set(dummy_h5ad_pair)
+    for p in dummy_h5ad_pair:
+        _assert_listing_matches_stat(got[p], p)
+
+def test_listing_directory(dummy_h5ad_pair, spark_collect, tmp_path):
+    for src in dummy_h5ad_pair:
+        os.symlink(src, tmp_path / os.path.basename(src))
+    (tmp_path / 'ignore.txt').write_text('not an h5ad')
+    sdf = construct_h5ad_path_df(path=str(tmp_path), spark=spark_collect)
+    rows = sdf.collect()
+    assert len(rows) == 2
+    got_names = {os.path.basename(r.file_path) for r in rows}
+    assert got_names == {os.path.basename(p) for p in dummy_h5ad_pair}
+    for r in rows:
+        _assert_listing_matches_stat(r, r.file_path)
+
+def test_listing_df_passthrough(dummy_h5ad_categorical_index, spark_collect):
+    incoming = spark_collect.createDataFrame(
+        [(dummy_h5ad_categorical_index,)], ['file_path']
+    )
+    out = construct_h5ad_path_df(df=incoming, spark=spark_collect)
+    assert out.columns == incoming.columns
+    assert [r.file_path for r in out.collect()] == [dummy_h5ad_categorical_index]
+
+def test_listing_path_and_df_rejected(dummy_h5ad_categorical_index, spark_collect):
+    incoming = spark_collect.createDataFrame(
+        [(dummy_h5ad_categorical_index,)], ['file_path']
+    )
+    with pytest.raises(ValueError, match='only path or df'):
+        construct_h5ad_path_df(
+            path=dummy_h5ad_categorical_index, df=incoming, spark=spark_collect
+        )
+
+def test_sam_from_listing_not_obs(dummy_h5ad_pair, spark_collect):
+    """sam is one row per file from the listing, not distinct obs cells."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    assert set(sdata.sam.columns) == {'fp_int', 'file_path'}
+    sam = sdata.sam.toPandas()
+    assert len(sam) == 2
+    assert set(sam['file_path']) == set(dummy_h5ad_pair)
+    assert sdata.obs.count() == 6
+    x_ids = {r.fp_int for r in sdata.X.select('fp_int').distinct().collect()}
+    assert x_ids == set(sam['fp_int'])
+
+def test_injected_fp_int_used_everywhere(dummy_h5ad_categorical_index, spark_collect):
+    """If the listing already has fp_int, do not re-hash; X/obs/var/sam all use it."""
+    listing = construct_h5ad_path_df(
+        path=dummy_h5ad_categorical_index, spark=spark_collect
+    ).withColumn('fp_int', F.lit(42).cast('int'))
+    sdata = SprayData.from_h5ads(
+        spark_collect, df=listing, from_raw=False,
+        mode='delta', force_partitioning=1,
+    )
+    assert sdata.sam.collect()[0].fp_int == 42
+    assert {r.fp_int for r in sdata.X.select('fp_int').distinct().collect()} == {42}
+    assert {r.fp_int for r in sdata.obs.select('fp_int').distinct().collect()} == {42}
+    assert {r.fp_int for r in sdata.var.select('fp_int').distinct().collect()} == {42}
+
+def test_inspect_maxsize_matches_h5py(dummy_h5ad_categorical_index, spark_collect):
+    """Inspect nnz equals the on-disk CSR data length (categorical dummy nnz=12)."""
+    import h5py
+    listing = construct_h5ad_path_df(
+        path=dummy_h5ad_categorical_index, spark=spark_collect
+    )
+    row = inspect_h5ads(listing, spark_collect, force_partitioning=1).collect()[0]
+    with h5py.File(dummy_h5ad_categorical_index, 'r') as f:
+        assert row.maxsize_main == f['X']['data'].shape[0]
+        assert row.dtype_main == str(f['X']['data'].dtype)
+    assert row.maxsize_main == 12
+    assert row.main_csr
+    assert not row.has_raw
+
+def test_inspect_empty_x_maxsize(dummy_h5ad_empty_x, spark_collect):
+    listing = construct_h5ad_path_df(path=dummy_h5ad_empty_x, spark=spark_collect)
+    row = inspect_h5ads(listing, spark_collect, force_partitioning=1).collect()[0]
+    assert row.maxsize_main == 0
+    assert row.main_csr
+
+def test_inspect_dtype_present(dummy_h5ad_categorical_index, spark_collect):
+    listing = construct_h5ad_path_df(
+        path=dummy_h5ad_categorical_index, spark=spark_collect
+    )
+    row = inspect_h5ads(listing, spark_collect, force_partitioning=1).collect()[0]
+    assert row.dtype_main == 'float32'
+
+def test_dense_h5ad_rejected(dummy_h5ad_dense, spark_collect):
+    with pytest.raises(ValueError, match='default X with a CSR format'):
+        SprayData.from_h5ads(
+            spark_collect, path=dummy_h5ad_dense, from_raw=False,
+            mode='delta', force_partitioning=1,
+        )
 
 def test_expression_empty_x(dummy_h5ad_empty_x, spark_collect):
     """nnz == 0 must ingest obs/var and produce an empty X, not IndexError."""

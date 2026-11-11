@@ -16,7 +16,9 @@ Functions and classes:
 from .read import (
     read_expression_from_h5ads,
     read_var_from_h5ads,
-    read_obs_from_h5ads
+    read_obs_from_h5ads,
+    construct_h5ad_path_df,
+    ensure_fp_int,
 )
 from typing import Optional, List, Dict, Any, Callable, Union
 import pyspark
@@ -177,10 +179,8 @@ class SprayData:
         string). The processing pipeline continues to operate on the skinny key
         columns; the metadata column simply rides along on obs/var.
 
-        `sam` is seeded here with one row per input file (fp_int, file_path) so it can
-        act as the sample registry for later additions - QC metrics, obs metadata that
-        is constant within a file (cs.md.promote_sample), or metadata from outside the
-        files (cs.md.add_sample_metadata).
+        `sam` is seeded here from the file listing (fp_int, file_path), not from
+        obs, so writing sam does not recompute the cell table from HDF5.
 
         parameters:
         -----------
@@ -201,10 +201,12 @@ class SprayData:
         """
 
 
+        listing = ensure_fp_int(construct_h5ad_path_df(path, df, spark))
+        sam = listing.select('fp_int', 'file_path').distinct()
+
         X = read_expression_from_h5ads(
             spark,
-            path=path,
-            df=df,
+            df=listing,
             force_partitioning=force_partitioning,
             chunk_size=chunk_size,
             from_raw=from_raw,
@@ -212,8 +214,7 @@ class SprayData:
         )
         var = read_var_from_h5ads(
             spark,
-            path=path,
-            df=df,
+            df=listing,
             gene_name_column=gene_name_column,
             from_raw=from_raw,
             fallback_default=fallback_default,
@@ -225,8 +226,7 @@ class SprayData:
         
         obs = read_obs_from_h5ads(
             spark,
-            path=path,
-            df=df,
+            df=listing,
             force_partitioning=force_partitioning,
             metadata_columns=obs_metadata_columns,
             metadata_variant=metadata_variant,
@@ -259,7 +259,7 @@ class SprayData:
             X=X,
             var=var,
             obs=obs,
-            sam=obs.select('fp_int', 'file_path').distinct(),
+            sam=sam,
             mode=mode
         )
 

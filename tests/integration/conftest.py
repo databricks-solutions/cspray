@@ -147,6 +147,21 @@ def dummy_h5ad_categorical_index():
     os.remove(f.name)
 
 @pytest.fixture(scope="module")
+def dummy_h5ad_dense():
+    """Dense (non-CSR) AnnData. Format check must reject it."""
+    import anndata as ad
+
+    adata = ad.AnnData(
+        X=np.arange(12, dtype="float32").reshape(3, 4),
+        obs=pd.DataFrame(index=["c0", "c1", "c2"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2", "g3"]),
+    )
+    f = tempfile.NamedTemporaryFile(delete=False, suffix=".h5ad")
+    adata.write(f.name)
+    yield f.name
+    os.remove(f.name)
+
+@pytest.fixture(scope="module")
 def dummy_h5ad_empty_x():
     """A CSR h5ad with cells/genes but zero stored values (nnz == 0).
 
