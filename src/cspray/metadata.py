@@ -129,11 +129,73 @@ def _payload_as_json_expr(df: DataFrame, col: str):
     return F.to_json(F.col(col))
 
 
+def _json_path(key: str) -> Optional[str]:
+    """JSONPath that treats ``key`` as one literal field, including dots.
+
+    Returns None when the key cannot be quoted (both quote types, or ``?``
+    combined with a quote that blocks the remaining bracket form). Callers
+    skip those keys rather than failing the whole promotion.
+    """
+    if not isinstance(key, str) or not key:
+        return None
+    has_single = "'" in key
+    has_double = '"' in key
+    has_q = "?" in key
+    if has_single and has_double:
+        return None
+    # get_json_object's ['name'] form rejects ``?``; use ["name"] instead.
+    if has_q and (has_single or has_double):
+        return None
+    if has_single or has_q:
+        return f'$["{key}"]'
+    return f"$['{key}']"
+
+
+def _safe_column_name(name: str) -> str:
+    """Spark/UC-safe unquoted identifier: ``orig.ident`` -> ``orig_ident``."""
+    out = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    if not out or out[0].isdigit():
+        out = "_" + out
+    return out
+
+
+def _unique_column_name(name: str, taken: set) -> str:
+    """Sanitise ``name`` and suffix ``_2``, ``_3``, ... on collision."""
+    base = _safe_column_name(name)
+    out = base
+    i = 2
+    while out in taken:
+        out = f"{base}_{i}"
+        i += 1
+    taken.add(out)
+    return out
+
+
+def _warn_skip_promote(key: str, reason: str) -> None:
+    print(f"promote: skipping {key!r} ({reason})")
+
+
+def _variant_get_expr(col: str, path: str, dtype: Optional[str]):
+    """Extract from a VARIANT column without interpolating ``path`` as SQL."""
+    target = dtype or "string"
+    if hasattr(F, "variant_get"):
+        return F.variant_get(F.col(col), path, target)
+    path_sql = path.replace("'", "''")
+    target_sql = target.replace("'", "''")
+    return F.expr(f"variant_get(`{col}`, '{path_sql}', '{target_sql}')")
+
+
 def _metadata_value_expr(df: DataFrame, col: str, key: str, dtype: Optional[str] = None):
-    """Extract one top-level metadata value from VARIANT or JSON."""
+    """Extract one top-level metadata value from VARIANT or JSON.
+
+    Returns None when ``key`` cannot be expressed as a JSONPath; callers skip.
+    """
+    path = _json_path(key)
+    if path is None:
+        return None
     if df.schema[col].dataType.simpleString() == "variant":
-        return F.expr(f"variant_get(`{col}`, '$.{key}', '{dtype or 'string'}')")
-    value = F.get_json_object(F.col(col), f"$.{key}")
+        return _variant_get_expr(col, path, dtype)
+    value = F.get_json_object(F.col(col), path)
     return value.cast(dtype) if dtype else value
 
 
@@ -659,7 +721,8 @@ def promote_sample(
     column : str, optional
         Override the payload column name (defaults to obs_data).
     prefix : str
-        Optional prefix for the created ``sam`` column names.
+        Optional prefix for the created ``sam`` column names. The prefix and
+        key are sanitised to a Spark-safe identifier (non-alphanumeric -> ``_``).
     dtypes : str or dict, optional
         Single Spark type for all keys, or per-key mapping. None keeps strings.
     strict : bool
@@ -693,13 +756,20 @@ def promote_sample(
             return dtypes.get(key)
         return None
 
-    aliases = [f"__sample_value_{i}" for i in range(len(keys))]
+    extract = []
+    for key in keys:
+        expr = _metadata_value_expr(obs, col, key, _dtype_for(key))
+        if expr is None:
+            _warn_skip_promote(key, "cannot build a JSONPath")
+            continue
+        extract.append((key, expr))
+    if not extract:
+        return sdata
+
+    aliases = [f"__sample_value_{i}" for i in range(len(extract))]
     values = obs.select(
         "file_path",
-        *[
-            _metadata_value_expr(obs, col, key, _dtype_for(key)).alias(alias)
-            for key, alias in zip(keys, aliases)
-        ],
+        *[expr.alias(alias) for (_, expr), alias in zip(extract, aliases)],
     )
 
     aggregations = []
@@ -723,7 +793,12 @@ def promote_sample(
                 f"conflicting file paths include {paths}"
             )
 
-    output_names = [f"{prefix}{key}" for key in keys]
+    # Uniquify within this batch and against identity columns; existing sam
+    # names are handled by if_exists (replace vs error) in the merge.
+    taken = {"file_path", "fp_int"}
+    output_names = [
+        _unique_column_name(f"{prefix}{key}", taken) for key, _ in extract
+    ]
     sample_metadata = by_sample.select(
         "file_path",
         *[
@@ -852,7 +927,8 @@ def promote(
     column : str, optional
         Override payload column name (defaults to obs_data / var_data).
     prefix : str
-        Prefix for the new column names (default '' -> column named as the key).
+        Prefix for the new column names (default '' -> sanitised key). Dots and
+        other non-alphanumeric characters in the key become ``_``.
     dtypes : str or dict, optional
         Target Spark type for extracted columns. A single string applies to all
         keys; a dict maps key -> type. Defaults to string. For VARIANT payloads
@@ -880,11 +956,16 @@ def promote(
             return dtypes
         return dtypes.get(k)
 
+    taken = set(df.columns)
     exprs = []
     for k in keys:
-        exprs.append(
-            _metadata_value_expr(df, col, k, _dtype_for(k)).alias(f"{prefix}{k}")
-        )
+        expr = _metadata_value_expr(df, col, k, _dtype_for(k))
+        if expr is None:
+            _warn_skip_promote(k, "cannot build a JSONPath")
+            continue
+        exprs.append(expr.alias(_unique_column_name(f"{prefix}{k}", taken)))
+    if not exprs:
+        return sdata if inplace else df
 
     out = df.select("*", *exprs)
     if inplace:
@@ -991,7 +1072,8 @@ def promote_suggested(
         :data:`DEFAULT_VARIANT_TYPE_MAP`).
     prefix : str
         Prefix for the promoted column names (guards against collisions with
-        existing columns).
+        existing columns). Combined with the key and sanitised to a Spark-safe
+        identifier (non-alphanumeric -> ``_``).
     profile_kwargs : dict, optional
         Extra keyword args forwarded to :func:`profile` (e.g. ``max_categorical``,
         ``sample``). ``verbose`` and ``per_file`` are managed internally.
