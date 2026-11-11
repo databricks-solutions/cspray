@@ -168,11 +168,14 @@ def test_cspray_metadata_profile_and_promote(downloaded_file, spark_collect):
     assert isinstance(matrix, pd.DataFrame)
 
     # --- promote a key into a top-level column -----------------------------
+    # Payload keys may contain spaces/dots; the Spark column is sanitised.
+    from cspray.metadata import _safe_column_name
     key = report['key'].iloc[0]
+    col = _safe_column_name(key)
     cs.md.promote(sdata, key, which='obs')
-    assert key in sdata.obs.columns
+    assert col in sdata.obs.columns
     # one value per cell, extracted as a (string) column
-    assert sdata.obs.select(key).count() == n_cells
+    assert sdata.obs.select(col).count() == n_cells
 
 def test_metadata_dummy_roundtrip(dummy_h5ad_pair, spark_collect):
     """End-to-end metadata check on two hand-built h5ad files with known values:
@@ -328,6 +331,82 @@ def test_promote_suggested_with_promote_sam(dummy_h5ad_pair, spark_collect):
 
     with pytest.raises(ValueError):
         cs.md.promote_suggested(sdata, which='obs', keys=['tissue'], promote_sam=True)
+
+
+def test_promote_json_path_helpers():
+    """JSONPath quoting and Spark identifier sanitising used by promotion."""
+    from cspray.metadata import _json_path, _safe_column_name
+
+    assert _json_path("orig.ident") == "$['orig.ident']"
+    assert _json_path("cell type") == "$['cell type']"
+    assert _json_path("a'b") == '$["a\'b"]'
+    assert _json_path('a"b') == '$[\'a"b\']'
+    assert _json_path("""a'"b""") is None
+    assert _json_path("") is None
+    assert _safe_column_name("orig.ident") == "orig_ident"
+    assert _safe_column_name("cell type") == "cell_type"
+    assert _safe_column_name("2bad") == "_2bad"
+
+
+def test_promote_keys_with_dots(spark_collect, tmp_path):
+    """Regression: payload keys with '.' (e.g. Seurat orig.ident) must extract
+    via bracket JSONPath and land as Spark-safe column names, including sam.
+    """
+    import anndata as ad
+    from scipy.sparse import csr_matrix
+
+    adata = ad.AnnData(
+        X=csr_matrix(np.arange(8, dtype="float32").reshape(2, 4)),
+        obs=pd.DataFrame({
+            "orig.ident": ["s1", "s1"],
+            "cell.type": pd.Categorical(["T", "B"]),
+        }, index=["c0", "c1"]),
+        var=pd.DataFrame({
+            "gene.biotype": ["protein_coding", "lncRNA", "protein_coding", "lncRNA"],
+        }, index=["g0", "g1", "g2", "g3"]),
+    )
+    path = str(tmp_path / "dots.h5ad")
+    adata.write(path)
+
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=[path], from_raw=False, mode="delta",
+        obs_metadata_columns="all", var_metadata_columns="all",
+        metadata_variant=False, force_partitioning=1,
+    )
+    sdata.set_intermediary_persistance(False)
+
+    plan = cs.md.promote_suggested(
+        sdata, which="both", promote_sam=True, dry_run=True, verbose=False,
+        profile_kwargs={"max_categorical": 3},
+    )
+    by_target = {w: set(g["key"]) for w, g in plan.groupby("which")}
+    assert "orig.ident" in by_target["sample"]
+    assert "cell.type" in by_target["obs"]
+    assert "gene.biotype" in by_target["var"]
+
+    cs.md.promote_suggested(
+        sdata, which="both", promote_sam=True, verbose=False,
+        profile_kwargs={"max_categorical": 3},
+    )
+
+    assert "orig_ident" in sdata.sam.columns
+    assert "orig.ident" not in sdata.sam.columns
+    assert sdata.sam.select("orig_ident").toPandas()["orig_ident"].iloc[0] == "s1"
+
+    assert "cell_type" in sdata.obs.columns
+    assert "cell.type" not in sdata.obs.columns
+    obs = sdata.obs.select("cell_barcode", "cell_type").toPandas().set_index("cell_barcode")
+    assert obs.loc["c0", "cell_type"] == "T"
+    assert obs.loc["c1", "cell_type"] == "B"
+    assert "orig.ident" in json.loads(
+        sdata.obs.select("obs_data").limit(1).toPandas()["obs_data"].iloc[0]
+    )
+
+    assert "gene_biotype" in sdata.var.columns
+    assert "gene.biotype" not in sdata.var.columns
+    var = sdata.var.select("gene_id", "gene_biotype").toPandas().set_index("gene_id")
+    assert var.loc["g0", "gene_biotype"] == "protein_coding"
+    assert var.loc["g1", "gene_biotype"] == "lncRNA"
 
 
 def test_metadata_promote_suggested(dummy_h5ad_pair, spark_collect):
