@@ -112,6 +112,24 @@ class SprayData:
             mode = 'databricks'
         self.mode=mode
 
+    def _iter_tables(self, subset=None):
+        """``(name, df)`` for DataFrames on this object, in ``write_order``.
+
+        ``subset`` restricts names (still ordered by ``write_order``). Names
+        not in ``write_order`` raise. Slots that are not DataFrames are skipped.
+        """
+        if subset is None:
+            names = list(self.write_order)
+        else:
+            extra = [k for k in subset if k not in self.write_order]
+            if extra:
+                raise ValueError(f'subset not in write_order: {extra}')
+            names = sorted(subset, key=self.write_order.index)
+        for k in names:
+            df = getattr(self, k, None)
+            if isinstance(df, pyspark.sql.DataFrame):
+                yield k, df
+
     def set_intermediary_persistance(
         self,
         persist : Optional[bool] = True,
@@ -325,9 +343,9 @@ class SprayData:
         subset : list, optional
             List of DataFrame names to write. Defaults to all in write_order.
         partition : bool, optional
-            If True, partitions tables on file_path. Defaults to True. Only applies to the bigger tables with cell idx: X,obs
+            If True, partitionBy file_path on tables that have that column.
         cluster : bool, optional
-            If True, clusters tables on cell_idx. Defaults to True.  Only applies to the bigger tables with cell idx: X,obs
+            If True, Z-order by cell_idx on tables that have that column.
         replace_where : str, optional
             Delta predicate (usually from ``fp_int_predicate``). None (default)
             overwrites each table, including schema. Set, it replaces only
@@ -340,31 +358,19 @@ class SprayData:
         """
         if write_fn is None:
             write_fn = DEFAULT_WRITERS[self.mode]
-        
-        if subset is not None:
-            subset = sorted(subset, key=lambda x: self.write_order.index(x))
-        else:
-            subset = self.write_order
 
-        print("subset = ", subset)
+        print("subset = ", subset if subset is not None else self.write_order)
         out_subset = []
-        for k in subset:
+        for k, df in self._iter_tables(subset):
             t0 = time.time()
-            if isinstance(self.__dict__[k],pyspark.sql.DataFrame):
-                print(table_base+join_char+k)
-                if k in ['X','obs']:
-                    write_fn(
-                        spark, self.__dict__[k], table_base+join_char+k,
-                        partition=partition, cluster=cluster,
-                        replace_where=replace_where,
-                    )
-                else:
-                    write_fn(
-                        spark, self.__dict__[k], table_base+join_char+k,
-                        partition=False, cluster=False,
-                        replace_where=replace_where,
-                    )
-                out_subset.append(k)
+            print(table_base+join_char+k)
+            write_fn(
+                spark, df, table_base+join_char+k,
+                partition=bool(partition) and 'file_path' in df.columns,
+                cluster=bool(cluster) and 'cell_idx' in df.columns,
+                replace_where=replace_where,
+            )
+            out_subset.append(k)
             print("time elapsed = ", time.time()-t0)
 
         if self.persist_intermediaries:

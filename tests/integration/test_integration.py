@@ -560,6 +560,82 @@ def test_write_order_sam_last():
     assert sdata.write_order == ['X', 'var', 'obs', 'clu', 'sta', 'sam']
 
 
+def _spy_writes():
+    written = []
+    def write_fn(spark, df, name, partition=False, cluster=False, replace_where=None):
+        written.append({
+            'name': name,
+            'partition': partition,
+            'cluster': cluster,
+            'replace_where': replace_where,
+            'columns': list(df.columns),
+        })
+    return written, write_fn
+
+
+def test_to_tables_writes_present_frames_in_order(dummy_h5ad_pair, spark_collect):
+    """None slots (clu/sta) are skipped; X first, sam last."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    written, spy = _spy_writes()
+    out = sdata.to_tables(
+        spark_collect, write_fn=spy, table_base='t', join_char='_'
+    )
+    assert out == ['X', 'var', 'obs', 'sam']
+    assert [w['name'] for w in written] == ['t_X', 't_var', 't_obs', 't_sam']
+    assert all(not w['partition'] and not w['cluster'] for w in written)
+
+
+def test_to_tables_writes_extra_slot_before_sam(dummy_h5ad_pair, spark_collect):
+    """A later table (obsm/layers) just joins write_order ahead of sam."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    sdata.obsm = sdata.obs
+    sdata.write_order = ['X', 'var', 'obs', 'obsm', 'clu', 'sta', 'sam']
+    written, spy = _spy_writes()
+    out = sdata.to_tables(
+        spark_collect, write_fn=spy, table_base='t', join_char='_'
+    )
+    assert out == ['X', 'var', 'obs', 'obsm', 'sam']
+    assert out[0] == 'X'
+    assert out[-1] == 'sam'
+    assert out.index('obsm') < out.index('sam')
+    assert [w['name'] for w in written] == [
+        't_X', 't_var', 't_obs', 't_obsm', 't_sam'
+    ]
+
+
+def test_to_tables_partition_cluster_follow_columns(dummy_h5ad_pair, spark_collect):
+    """Flags apply by column, not by a hardcoded ['X','obs'] name list."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    written, spy = _spy_writes()
+    sdata.to_tables(
+        spark_collect, write_fn=spy, table_base='t', join_char='_',
+        partition=True, cluster=True,
+    )
+    by = {w['name']: w for w in written}
+    assert by['t_X']['partition'] and by['t_X']['cluster']
+    assert by['t_obs']['partition'] and by['t_obs']['cluster']
+    assert by['t_var']['partition'] and not by['t_var']['cluster']
+    assert by['t_sam']['partition'] and not by['t_sam']['cluster']
+
+
+def test_to_tables_subset_unknown_raises():
+    sdata = SprayData()
+    with pytest.raises(ValueError, match='not in write_order'):
+        sdata.to_tables(None, write_fn=lambda *a, **k: None, subset=['obsm'])
+
+
 def test_sam_from_listing_not_obs(dummy_h5ad_pair, spark_collect):
     """sam is one row per file from the listing, not distinct obs cells."""
     sdata = SprayData.from_h5ads(
