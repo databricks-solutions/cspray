@@ -23,12 +23,40 @@ from .read import (
 from typing import Optional, List, Dict, Any, Callable, Union
 import pyspark
 from pyspark.sql import functions as F
+from pyspark.sql import types as T
 import time
 import warnings
 
 from .write import DEFAULT_WRITERS
 from .read import DEFAULT_READERS
 from .utils import get_storage_level
+
+# Identity plus ingest signature. Promote / add_sample_metadata cannot overwrite
+# these; they are how a later run diffs the directory against the lake.
+SAM_IDENTITY_COLUMNS = ('fp_int', 'file_path')
+SAM_INGEST_COLUMNS = ('source_length', 'source_modified', 'ingested_at')
+SAM_REGISTRY_COLUMNS = SAM_IDENTITY_COLUMNS + SAM_INGEST_COLUMNS
+
+
+def sam_from_listing(listing: pyspark.sql.DataFrame) -> pyspark.sql.DataFrame:
+    """One row per file: fp_int, path, listing size/mtime, and ingest time.
+
+    ``source_length`` / ``source_modified`` are copied from the listing when
+    present (path-built listings always have them). A caller-supplied ``df``
+    that is only ``file_path`` still gets the columns, as nulls, so ``sam``
+    schema is stable. ``ingested_at`` is always now.
+    """
+    listing = ensure_fp_int(listing)
+    cols = ['fp_int', 'file_path']
+    for c in ('source_length', 'source_modified'):
+        if c in listing.columns:
+            cols.append(c)
+    sam = listing.select(*cols).dropDuplicates(['fp_int', 'file_path'])
+    if 'source_length' not in sam.columns:
+        sam = sam.withColumn('source_length', F.lit(None).cast(T.LongType()))
+    if 'source_modified' not in sam.columns:
+        sam = sam.withColumn('source_modified', F.lit(None).cast(T.DoubleType()))
+    return sam.withColumn('ingested_at', F.current_timestamp())
 
 class SprayData:
     """
@@ -179,8 +207,10 @@ class SprayData:
         string). The processing pipeline continues to operate on the skinny key
         columns; the metadata column simply rides along on obs/var.
 
-        `sam` is seeded here from the file listing (fp_int, file_path), not from
-        obs, so writing sam does not recompute the cell table from HDF5.
+        `sam` is seeded here from the file listing (fp_int, file_path, size,
+        mtime) plus ingested_at, not from obs, so writing sam does not
+        recompute the cell table from HDF5. Those columns are the ingest
+        registry; promote/add_sample_metadata cannot overwrite them.
 
         parameters:
         -----------
@@ -202,7 +232,7 @@ class SprayData:
 
 
         listing = ensure_fp_int(construct_h5ad_path_df(path, df, spark))
-        sam = listing.select('fp_int', 'file_path').distinct()
+        sam = sam_from_listing(listing)
 
         X = read_expression_from_h5ads(
             spark,

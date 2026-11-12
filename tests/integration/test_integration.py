@@ -7,7 +7,7 @@ from scipy import stats
 import numpy as np
 import pandas as pd
 
-from cspray.data import SprayData
+from cspray.data import SAM_REGISTRY_COLUMNS, SprayData, sam_from_listing
 from cspray.read import _explode_nnz_ranges, construct_h5ad_path_df, inspect_h5ads
 import cspray as cs
 from pyspark.sql import functions as F
@@ -195,7 +195,7 @@ def test_metadata_dummy_roundtrip(dummy_h5ad_pair, spark_collect):
     # 1. sam exists immediately at one row per input file -------------------
     sam = sdata.sam.toPandas()
     assert len(sam) == 2
-    assert set(sam.columns) == {'fp_int', 'file_path'}
+    assert set(sam.columns) == set(SAM_REGISTRY_COLUMNS)
     assert set(sam['file_path']) == set(dummy_h5ad_pair)
 
     # 2. every cell carries metadata, keyed to the right barcode ------------
@@ -552,13 +552,66 @@ def test_sam_from_listing_not_obs(dummy_h5ad_pair, spark_collect):
         spark_collect, path=dummy_h5ad_pair, from_raw=False,
         mode='delta', force_partitioning=2,
     )
-    assert set(sdata.sam.columns) == {'fp_int', 'file_path'}
+    assert set(sdata.sam.columns) == set(SAM_REGISTRY_COLUMNS)
     sam = sdata.sam.toPandas()
     assert len(sam) == 2
     assert set(sam['file_path']) == set(dummy_h5ad_pair)
     assert sdata.obs.count() == 6
     x_ids = {r.fp_int for r in sdata.X.select('fp_int').distinct().collect()}
     assert x_ids == set(sam['fp_int'])
+    by_path = {r.file_path: r for r in sdata.sam.collect()}
+    for p in dummy_h5ad_pair:
+        _assert_listing_matches_stat(by_path[p], p)
+        assert by_path[p].ingested_at is not None
+
+
+def test_sam_from_listing_helper_copies_signature(dummy_h5ad_categorical_index, spark_collect):
+    listing = construct_h5ad_path_df(
+        path=dummy_h5ad_categorical_index, spark=spark_collect
+    )
+    listing = listing.withColumn('fp_int', F.lit(7).cast('int'))
+    sam = sam_from_listing(listing)
+    assert set(sam.columns) == set(SAM_REGISTRY_COLUMNS)
+    row = sam.collect()[0]
+    assert row.fp_int == 7
+    _assert_listing_matches_stat(row, dummy_h5ad_categorical_index)
+    assert row.ingested_at is not None
+
+
+def test_sam_from_path_only_df_has_null_signature(dummy_h5ad_categorical_index, spark_collect):
+    incoming = spark_collect.createDataFrame(
+        [(dummy_h5ad_categorical_index,)], ['file_path']
+    )
+    sam = sam_from_listing(incoming)
+    row = sam.collect()[0]
+    assert row.file_path == dummy_h5ad_categorical_index
+    assert row.source_length is None
+    assert row.source_modified is None
+    assert row.ingested_at is not None
+    assert row.fp_int is not None
+
+
+def test_sam_registry_columns_not_overwritten(dummy_h5ad_pair, spark_collect):
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    before = (
+        sdata.sam.select('file_path', 'source_length').toPandas()
+        .sort_values('file_path').reset_index(drop=True)
+    )
+    poison = spark_collect.createDataFrame(
+        [(dummy_h5ad_pair[0], 1), (dummy_h5ad_pair[1], 2)],
+        ['file_path', 'source_length'],
+    )
+    with pytest.raises(ValueError, match='registry columns'):
+        cs.md.add_sample_metadata(sdata, poison)
+    after = (
+        sdata.sam.select('file_path', 'source_length').toPandas()
+        .sort_values('file_path').reset_index(drop=True)
+    )
+    assert after.equals(before)
 
 def test_injected_fp_int_used_everywhere(dummy_h5ad_categorical_index, spark_collect):
     """If the listing already has fp_int, do not re-hash; X/obs/var/sam all use it."""

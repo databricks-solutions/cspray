@@ -56,6 +56,8 @@ from pyspark.sql import Window
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
+from .data import SAM_REGISTRY_COLUMNS
+
 # which -> (SprayData attribute, default payload column, row-key column)
 _AXES = {
     "obs": ("obs", "obs_data", "cell_idx"),
@@ -545,10 +547,12 @@ def _merge_sample_metadata(sdata, metadata: DataFrame, on, if_exists: str):
     keys = [on] if isinstance(on, str) else list(on)
     new_columns = [c for c in metadata.columns if c not in keys]
 
-    # Replacing these would rewrite sample identity from an arbitrary table.
-    identity = [c for c in new_columns if c in ("fp_int", "file_path")]
-    if identity:
-        raise ValueError(f"sample identity columns cannot be joined as metadata: {identity}")
+    # Replacing these would rewrite sample identity or the ingest signature.
+    reserved = [c for c in new_columns if c in SAM_REGISTRY_COLUMNS]
+    if reserved:
+        raise ValueError(
+            f"sample registry columns cannot be joined as metadata: {reserved}"
+        )
 
     base = sdata.sam
     conflicts = [c for c in new_columns if c in base.columns]
@@ -795,7 +799,7 @@ def promote_sample(
 
     # Uniquify within this batch and against identity columns; existing sam
     # names are handled by if_exists (replace vs error) in the merge.
-    taken = {"file_path", "fp_int"}
+    taken = set(SAM_REGISTRY_COLUMNS)
     output_names = [
         _unique_column_name(f"{prefix}{key}", taken) for key, _ in extract
     ]
