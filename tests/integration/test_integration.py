@@ -8,7 +8,12 @@ import numpy as np
 import pandas as pd
 
 from cspray.data import SAM_REGISTRY_COLUMNS, SprayData, sam_from_listing
-from cspray.read import _explode_nnz_ranges, construct_h5ad_path_df, inspect_h5ads
+from cspray.read import (
+    _explode_nnz_ranges,
+    assign_fp_int,
+    construct_h5ad_path_df,
+    inspect_h5ads,
+)
 import cspray as cs
 from pyspark.sql import functions as F
 
@@ -620,6 +625,60 @@ def test_sam_registry_columns_not_overwritten(dummy_h5ad_pair, spark_collect):
         .sort_values('file_path').reset_index(drop=True)
     )
     assert after.equals(before)
+
+def test_assign_fp_int_hashes_without_registry(spark_collect):
+    listing = spark_collect.createDataFrame(
+        [('/tmp/a.h5ad',)], ['file_path']
+    )
+    hashed = assign_fp_int(listing)
+    expected = listing.withColumn('fp_int', F.hash('file_path'))
+    assert hashed.collect()[0].fp_int == expected.collect()[0].fp_int
+
+
+def test_assign_fp_int_empty_registry_starts_at_zero(spark_collect):
+    listing = spark_collect.createDataFrame(
+        [('/tmp/b.h5ad',), ('/tmp/a.h5ad',)], ['file_path']
+    )
+    empty = spark_collect.createDataFrame([], 'file_path string, fp_int int')
+    out = {r.file_path: r.fp_int for r in assign_fp_int(listing, empty).collect()}
+    assert out == {'/tmp/a.h5ad': 0, '/tmp/b.h5ad': 1}
+
+
+def test_assign_fp_int_keeps_hits_and_increments(spark_collect):
+    listing = spark_collect.createDataFrame(
+        [('/tmp/a.h5ad',), ('/tmp/b.h5ad',), ('/tmp/c.h5ad',)],
+        ['file_path'],
+    )
+    existing = spark_collect.createDataFrame(
+        [('/tmp/a.h5ad', 7)], ['file_path', 'fp_int']
+    )
+    out = {r.file_path: r.fp_int for r in assign_fp_int(listing, existing).collect()}
+    assert out['/tmp/a.h5ad'] == 7
+    assert out['/tmp/b.h5ad'] == 8
+    assert out['/tmp/c.h5ad'] == 9
+
+
+def test_assign_fp_int_never_renumbers(spark_collect):
+    listing = spark_collect.createDataFrame([('/tmp/a.h5ad',)], ['file_path'])
+    existing = spark_collect.createDataFrame(
+        [('/tmp/a.h5ad', 7)], ['file_path', 'fp_int']
+    )
+    again = assign_fp_int(listing, existing).collect()[0].fp_int
+    assert again == 7
+
+
+def test_from_h5ads_existing_sam_keeps_fp_int(dummy_h5ad_pair, spark_collect):
+    a, b = sorted(dummy_h5ad_pair)
+    existing = spark_collect.createDataFrame([(a, 7)], ['file_path', 'fp_int'])
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2, existing_sam=existing,
+    )
+    by_path = {r.file_path: r.fp_int for r in sdata.sam.collect()}
+    assert by_path[a] == 7
+    assert by_path[b] == 8
+    assert {r.fp_int for r in sdata.X.select('fp_int').distinct().collect()} == {7, 8}
+
 
 def test_injected_fp_int_used_everywhere(dummy_h5ad_categorical_index, spark_collect):
     """If the listing already has fp_int, do not re-hash; X/obs/var/sam all use it."""

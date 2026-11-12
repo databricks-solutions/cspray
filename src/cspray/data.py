@@ -19,6 +19,7 @@ from .read import (
     read_obs_from_h5ads,
     construct_h5ad_path_df,
     ensure_fp_int,
+    assign_fp_int,
 )
 from typing import Optional, List, Dict, Any, Callable, Union
 import pyspark
@@ -190,6 +191,7 @@ class SprayData:
         var_metadata_columns: Optional[Union[str, List[str]]] = None,
         metadata_variant: Optional[bool] = True,
         metadata_chunk_size: Optional[int] = 50_000,
+        existing_sam: Optional[pyspark.sql.DataFrame] = None,
     ):
         """ Read h5ad files into SprayData object 
 
@@ -228,10 +230,15 @@ class SprayData:
         var_metadata_columns: 'all' or list of var column names to capture into a `var_data` column. None (default) captures none.
         metadata_variant: if True (default) metadata columns are stored as VARIANT (needs Spark 3.5+/DBR 15.3+); if False they are kept as JSON strings.
         metadata_chunk_size: number of obs/var rows (cells/genes) read per chunk. Bounds per-worker memory independent of file size; files smaller than this read in a single chunk. None reads each file whole. Defaults to 50,000.
+        existing_sam: optional registry (at least file_path, fp_int). Hits keep
+            their id; new paths get max+1. None (default) hashes the path.
         """
 
 
-        listing = ensure_fp_int(construct_h5ad_path_df(path, df, spark))
+        listing = assign_fp_int(
+            construct_h5ad_path_df(path, df, spark),
+            existing_sam=existing_sam,
+        )
         sam = sam_from_listing(listing)
 
         X = read_expression_from_h5ads(
