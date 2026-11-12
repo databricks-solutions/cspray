@@ -14,6 +14,7 @@ from cspray.read import (
     construct_h5ad_path_df,
     inspect_h5ads,
 )
+from cspray.write import fp_int_predicate
 import cspray as cs
 from pyspark.sql import functions as F
 
@@ -673,6 +674,94 @@ def test_from_h5ads_existing_sam_keeps_fp_int(dummy_h5ad_pair, spark_collect):
     assert by_path[a] == 7
     assert by_path[b] == 8
     assert {r.fp_int for r in sdata.X.select('fp_int').distinct().collect()} == {7, 8}
+
+
+def test_fp_int_predicate_range_and_in():
+    assert fp_int_predicate([7]) == 'fp_int = 7'
+    assert fp_int_predicate([10, 11, 12]) == 'fp_int BETWEEN 10 AND 12'
+    assert fp_int_predicate([1, 3, 5]) == 'fp_int IN (1, 3, 5)'
+    assert fp_int_predicate([0, 1, 2, 5, 9]) == (
+        '(fp_int BETWEEN 0 AND 2) OR (fp_int IN (5, 9))'
+    )
+
+
+def test_fp_int_predicate_empty_raises():
+    with pytest.raises(ValueError, match='at least one fp_int'):
+        fp_int_predicate([])
+
+
+def test_to_tables_default_overwrite_wipes_other_files(
+    dummy_h5ad_pair, spark_collect, tmp_path
+):
+    """No replace_where still replaces the whole table."""
+    spark = spark_collect
+    table_base = str(tmp_path)
+    sdata = SprayData.from_h5ads(
+        spark, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    sdata.to_tables(spark, table_base=table_base, join_char='/')
+
+    keep = 0
+    sdata.X = sdata.X.filter(F.col('fp_int') == keep)
+    sdata.obs = sdata.obs.filter(F.col('fp_int') == keep)
+    sdata.var = sdata.var.filter(F.col('fp_int') == keep)
+    sdata.sam = sdata.sam.filter(F.col('fp_int') == keep)
+    sdata.to_tables(spark, table_base=table_base, join_char='/')
+
+    loaded = SprayData.from_tables(
+        spark, table_base=table_base, join_char='/', mode='delta'
+    )
+    assert {r.fp_int for r in loaded.X.select('fp_int').distinct().collect()} == {keep}
+    assert {r.fp_int for r in loaded.sam.select('fp_int').distinct().collect()} == {keep}
+
+
+def test_replace_where_keeps_other_fp_int(
+    dummy_h5ad_pair, spark_collect, tmp_path
+):
+    """replaceWhere on one fp_int leaves the other file's rows in place."""
+    spark = spark_collect
+    table_base = str(tmp_path)
+    sdata = SprayData.from_h5ads(
+        spark, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    sdata.to_tables(spark, table_base=table_base, join_char='/')
+
+    ids = sorted({r.fp_int for r in sdata.sam.select('fp_int').collect()})
+    replace_id, keep_id = ids[0], ids[1]
+    keep_obs = sdata.obs.filter(F.col('fp_int') == keep_id).count()
+
+    sdata.X = (
+        sdata.X.filter(F.col('fp_int') == replace_id)
+        .withColumn('expression', F.lit(99.0))
+    )
+    sdata.obs = sdata.obs.filter(F.col('fp_int') == replace_id)
+    sdata.var = sdata.var.filter(F.col('fp_int') == replace_id)
+    sdata.sam = sdata.sam.filter(F.col('fp_int') == replace_id)
+    sdata.to_tables_and_reset(
+        spark, table_base=table_base, join_char='/',
+        replace_where=fp_int_predicate([replace_id]),
+    )
+
+    assert {r.fp_int for r in sdata.X.select('fp_int').distinct().collect()} == {
+        replace_id, keep_id
+    }
+    exprs = {
+        r.expression
+        for r in sdata.X.filter(F.col('fp_int') == replace_id)
+        .select('expression').distinct().collect()
+    }
+    assert exprs == {99.0}
+    assert sdata.obs.filter(F.col('fp_int') == keep_id).count() == keep_obs
+    keep_exprs = {
+        r.expression
+        for r in sdata.X.filter(F.col('fp_int') == keep_id)
+        .select('expression').distinct().collect()
+    }
+    assert 99.0 not in keep_exprs
 
 
 def test_injected_fp_int_used_everywhere(dummy_h5ad_categorical_index, spark_collect):

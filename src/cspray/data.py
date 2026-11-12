@@ -309,6 +309,7 @@ class SprayData:
         subset:Optional[List]=None,
         partition: Optional[bool]=False,
         cluster: Optional[bool]=False,
+        replace_where: Optional[str]=None,
         ):
         """
         Write DataFrames in SprayData to tables in a Spark session.
@@ -327,6 +328,10 @@ class SprayData:
             If True, partitions tables on file_path. Defaults to True. Only applies to the bigger tables with cell idx: X,obs
         cluster : bool, optional
             If True, clusters tables on cell_idx. Defaults to True.  Only applies to the bigger tables with cell idx: X,obs
+        replace_where : str, optional
+            Delta predicate (usually from ``fp_int_predicate``). None (default)
+            overwrites each table, including schema. Set, it replaces only
+            matching rows and cannot change schema.
 
         Returns
         -------
@@ -348,9 +353,17 @@ class SprayData:
             if isinstance(self.__dict__[k],pyspark.sql.DataFrame):
                 print(table_base+join_char+k)
                 if k in ['X','obs']:
-                    write_fn(spark, self.__dict__[k], table_base+join_char+k, partition=partition, cluster=cluster)
+                    write_fn(
+                        spark, self.__dict__[k], table_base+join_char+k,
+                        partition=partition, cluster=cluster,
+                        replace_where=replace_where,
+                    )
                 else:
-                    write_fn(spark, self.__dict__[k], table_base+join_char+k, partition=False, cluster=False)
+                    write_fn(
+                        spark, self.__dict__[k], table_base+join_char+k,
+                        partition=False, cluster=False,
+                        replace_where=replace_where,
+                    )
                 out_subset.append(k)
             print("time elapsed = ", time.time()-t0)
 
@@ -408,6 +421,7 @@ class SprayData:
         subset:Optional[List]=None,
         partition: Optional[bool]=False,
         cluster: Optional[bool]=False,
+        replace_where: Optional[str]=None,
     ):
         """
         Write DataFrames in SprayData to tables and reset them by reloading from tables.
@@ -426,6 +440,8 @@ class SprayData:
             Character to join base name and table name. Defaults to '.'.
         subset : list, optional
             List of DataFrame names to write and reset. Defaults to all in write_order.
+        replace_where : str, optional
+            Forwarded to ``to_tables``. None (default) is a full overwrite.
         
         Returns
         -------
@@ -441,7 +457,8 @@ class SprayData:
             join_char=join_char, 
             subset=subset, 
             partition=partition,
-            cluster=cluster
+            cluster=cluster,
+            replace_where=replace_where,
         )
 
         # reset the ones that were saved
