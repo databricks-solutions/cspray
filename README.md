@@ -12,7 +12,7 @@
   
   **Scale your single-cell RNA analysis across atlas-sized datasets**
   
-  [Installation](#install) • [Quick Start](#minimal-example) • [About](#about)
+  [Installation](#install) • [Daily ingest](#updating-tables-from-h5ads-on-disk) • [Processing pipeline](#minimal-example-run-the-cspray-pipeline) • [About](#about)
   
 </div>
 
@@ -50,7 +50,8 @@ Additionally for Databricks users there are some example notebooks and we expect
 
 CSpray is a python package for end-to-end processing of single cell data using pyspark for efficient distributed compute. This allows for scaling of single cell RNA analysis over the scale of many samples, including multiple atlas scale h5ad files, and with increasing sample sizes as technology continues to improve. The package has several key modules that represent key analysis stages:
  
- - read : ingestion of h5ad to dataframes
+ - ingest : keep Delta tables up to date from a directory of h5ads (`cspray.ingest.run`)
+ - read : one-off load of h5ad to dataframes (`from_h5ads`)
  - preprocessing : gene/cell filtering, highly variable gene annotation
  - tools : PCA, clustering, marker gene extraction
 
@@ -64,7 +65,46 @@ All stages are written in native PySpark, or with convenient PySpark tooling suc
 
 Ultimately, with high-level clusters of cells identified across many samples, one can perform reference-free annotation of each cluster. Since this process can rely on the marker genes already calculated per cluster and an LLM, the total number of LLM calls required is relatively few and therefore makes for a cost-effective approach for performing cell type labeling at large scale for the purpose of data discovery. Say a user wants to find all cells of a certain type in samples from certain tissues, they'll be able to find these quickly. They can then pull the data from all samples post-PCA into a SprayData object and continue their analysis from that point with the pre-filtering and HVG already performed.
 
-## Minimal Example
+These next two sections are different jobs:
+
+- **Already processed h5ads on disk**, and you want Delta tables that stay in
+  sync as that directory grows or files get replaced → `cspray.ingest.run`
+  (no QC / HVG / PCA).
+- **You want cspray to filter, HVG, PCA, and cluster** → the pipeline example.
+  That path starts from `from_h5ads` and **overwrites** bronze/silver/gold each
+  run. It is not the daily “add last night’s files” job.
+
+## Updating tables from h5ads on disk
+
+Use this when the h5ads are already processed (your own pipeline, a published
+atlas, a collaborator’s files). `ingest.run` only maintains the tables: new
+files are added, files that changed on disk are rewritten, unchanged files are
+left alone. Same call every day.
+
+```
+import cspray as cs
+
+cs.ingest.run(
+    spark,
+    path='/data/h5ads',          # directory, one file, or a list of paths
+    table_base='singlecell.bronze',
+    from_raw=False,              # files are already processed
+)
+```
+
+Do not follow this with `from_h5ads` + overwrite — that would rebuild every
+table from scratch, which is the other example.
+
+To re-read a file that did not look changed (same size and last-modified time),
+pass it to `force=` by path or by `fp_int`. To reload the whole corpus, drop
+the tables and call `run` again.
+
+## Minimal Example: run the cspray pipeline
+
+Use this when you want cspray’s own QC → HVG → PCA → clustering, not when you
+are only mirroring a directory of finished h5ads into Delta. `from_h5ads` loads
+into memory-backed Spark frames; `to_tables_and_reset` **replaces** those
+tables on every run.
 
 ```
 from cspray.data import SprayData

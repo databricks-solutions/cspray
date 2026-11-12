@@ -59,26 +59,31 @@ your data and compute.
 
 #### Ingesting already-processed files on serverless
 
-The above is also all you need for the common case of ingesting a set of files
-that have already been processed elsewhere - published atlases, or data a
-collaborator has already filtered and normalised - where the goal is a queryable
-set of tables rather than reprocessing. Read the files, land them as tables, then
-sort out the metadata:
+The common case is a directory of files that have already been processed
+elsewhere — published atlases, or data a collaborator has already filtered and
+normalised — where the goal is a queryable set of tables that stay up to date.
+Use `cspray.ingest.run` for that (same call every day). Then load and sort out
+the metadata:
 
 ```
-sdata = SprayData.from_h5ads(
+import cspray as cs
+
+cs.ingest.run(
     spark,
     path=path,
+    table_base=f'{CATALOG}.{SCHEMA}',
+    join_char='.bronze_',
     from_raw=False,
     force_partitioning=500,
     chunk_size=int(6_000_000),
     obs_metadata_columns='all',
     var_metadata_columns='all',
 )
-sdata.set_intermediary_persistance(persist=False)
 
-# write before touching the metadata: this is the only pass over the h5ad files
-sdata.to_tables_and_reset(spark, table_base=f'{CATALOG}.{SCHEMA}', join_char='.bronze_')
+sdata = SprayData.from_tables(
+    spark, table_base=f'{CATALOG}.{SCHEMA}', join_char='.bronze_',
+)
+sdata.set_intermediary_persistance(persist=False)
 
 # typed columns for the keys worth filtering on, with keys that are constant
 # within a file collected onto the sample table instead of every cell
