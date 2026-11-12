@@ -18,7 +18,6 @@ from .read import (
     read_var_from_h5ads,
     read_obs_from_h5ads,
     construct_h5ad_path_df,
-    ensure_fp_int,
     assign_fp_int,
 )
 from typing import Optional, List, Dict, Any, Callable, Union
@@ -47,7 +46,7 @@ def sam_from_listing(listing: pyspark.sql.DataFrame) -> pyspark.sql.DataFrame:
     that is only ``file_path`` still gets the columns, as nulls, so ``sam``
     schema is stable. ``ingested_at`` is always now.
     """
-    listing = ensure_fp_int(listing)
+    listing = assign_fp_int(listing)
     cols = ['fp_int', 'file_path']
     for c in ('source_length', 'source_modified'):
         if c in listing.columns:
@@ -231,7 +230,8 @@ class SprayData:
         metadata_variant: if True (default) metadata columns are stored as VARIANT (needs Spark 3.5+/DBR 15.3+); if False they are kept as JSON strings.
         metadata_chunk_size: number of obs/var rows (cells/genes) read per chunk. Bounds per-worker memory independent of file size; files smaller than this read in a single chunk. None reads each file whole. Defaults to 50,000.
         existing_sam: optional registry (at least file_path, fp_int). Hits keep
-            their id; new paths get max+1. None (default) hashes the path.
+            their id; new paths get max+1. None (default) numbers the listing
+            0, 1, … in path order.
         """
 
 

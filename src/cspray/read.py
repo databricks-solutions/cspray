@@ -651,7 +651,11 @@ def construct_h5ad_path_df(
     return df
 
 def ensure_fp_int(df: pyspark.sql.DataFrame) -> pyspark.sql.DataFrame:
-    """Add fp_int = hash(file_path) unless the listing already carries it."""
+    """Add fp_int = hash(file_path) unless the listing already carries it.
+
+    Not used by from_h5ads / assign_fp_int (those number 0, 1, …). Kept for
+    callers that still want a path hash.
+    """
     if 'fp_int' not in df.columns:
         df = df.withColumn('fp_int', F.hash('file_path'))
     return df
@@ -663,10 +667,9 @@ def assign_fp_int(
     """Put ``fp_int`` on the listing.
 
     * Listing already has ``fp_int`` → leave it (caller-injected).
-    * ``existing_sam is None`` → hash the path (``from_h5ads`` without a lake).
+    * ``existing_sam is None`` or empty → ``0, 1, …`` in path order.
     * Otherwise look up ``file_path`` in ``existing_sam``. Hits keep their id;
       new paths get ``max(fp_int)+1`` upward, sorted by path. Never renumber.
-      An empty registry starts at 0.
 
     The file list is small; ``max`` is one collect. New ids are a window over
     unseen paths only.
@@ -674,7 +677,9 @@ def assign_fp_int(
     if 'fp_int' in listing.columns:
         return listing
     if existing_sam is None:
-        return ensure_fp_int(listing)
+        existing_sam = listing.sparkSession.createDataFrame(
+            [], 'file_path string, fp_int int'
+        )
 
     known = (
         existing_sam
@@ -698,7 +703,7 @@ def assign_fp_int(
 
 def _file_identity_df(df: pyspark.sql.DataFrame) -> pyspark.sql.DataFrame:
     """Skinny (file_path, fp_int) used by the readers. Drops listing extras."""
-    return ensure_fp_int(df).select('file_path', 'fp_int').distinct()
+    return assign_fp_int(df).select('file_path', 'fp_int').distinct()
 
 _INSPECT_SCHEMA = T.StructType([
     T.StructField('file_path', T.StringType(), False),

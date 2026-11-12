@@ -576,6 +576,9 @@ def test_sam_from_listing_not_obs(dummy_h5ad_pair, spark_collect):
     for p in dummy_h5ad_pair:
         _assert_listing_matches_stat(by_path[p], p)
         assert by_path[p].ingested_at is not None
+    ordered = sorted(dummy_h5ad_pair)
+    assert by_path[ordered[0]].fp_int == 0
+    assert by_path[ordered[1]].fp_int == 1
 
 
 def test_sam_from_listing_helper_copies_signature(dummy_h5ad_categorical_index, spark_collect):
@@ -601,7 +604,7 @@ def test_sam_from_path_only_df_has_null_signature(dummy_h5ad_categorical_index, 
     assert row.source_length is None
     assert row.source_modified is None
     assert row.ingested_at is not None
-    assert row.fp_int is not None
+    assert row.fp_int == 0
 
 
 def test_sam_registry_columns_not_overwritten(dummy_h5ad_pair, spark_collect):
@@ -626,22 +629,14 @@ def test_sam_registry_columns_not_overwritten(dummy_h5ad_pair, spark_collect):
     )
     assert after.equals(before)
 
-def test_assign_fp_int_hashes_without_registry(spark_collect):
-    listing = spark_collect.createDataFrame(
-        [('/tmp/a.h5ad',)], ['file_path']
-    )
-    hashed = assign_fp_int(listing)
-    expected = listing.withColumn('fp_int', F.hash('file_path'))
-    assert hashed.collect()[0].fp_int == expected.collect()[0].fp_int
-
-
-def test_assign_fp_int_empty_registry_starts_at_zero(spark_collect):
+def test_assign_fp_int_none_matches_empty_registry(spark_collect):
     listing = spark_collect.createDataFrame(
         [('/tmp/b.h5ad',), ('/tmp/a.h5ad',)], ['file_path']
     )
     empty = spark_collect.createDataFrame([], 'file_path string, fp_int int')
-    out = {r.file_path: r.fp_int for r in assign_fp_int(listing, empty).collect()}
-    assert out == {'/tmp/a.h5ad': 0, '/tmp/b.h5ad': 1}
+    from_none = {r.file_path: r.fp_int for r in assign_fp_int(listing).collect()}
+    from_empty = {r.file_path: r.fp_int for r in assign_fp_int(listing, empty).collect()}
+    assert from_none == from_empty == {'/tmp/a.h5ad': 0, '/tmp/b.h5ad': 1}
 
 
 def test_assign_fp_int_keeps_hits_and_increments(spark_collect):
