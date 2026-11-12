@@ -546,6 +546,14 @@ def test_listing_path_and_df_rejected(dummy_h5ad_categorical_index, spark_collec
             path=dummy_h5ad_categorical_index, df=incoming, spark=spark_collect
         )
 
+def test_write_order_sam_last():
+    """X first (fail-fast); sam last so a crash still looks uningested."""
+    sdata = SprayData()
+    assert sdata.write_order[0] == 'X'
+    assert sdata.write_order[-1] == 'sam'
+    assert sdata.write_order == ['X', 'var', 'obs', 'clu', 'sta', 'sam']
+
+
 def test_sam_from_listing_not_obs(dummy_h5ad_pair, spark_collect):
     """sam is one row per file from the listing, not distinct obs cells."""
     sdata = SprayData.from_h5ads(

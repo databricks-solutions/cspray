@@ -105,7 +105,7 @@ class SprayData:
         self.uns = uns
         self._file_mapping = None  # Cache for lazy loading
         self.write_order = [
-            'X','var','obs','sam','clu','sta'
+            'X','var','obs','clu','sta','sam'
         ]
         self.set_intermediary_persistance()
         if mode is None:
