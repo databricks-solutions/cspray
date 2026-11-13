@@ -814,7 +814,7 @@ def test_replace_where_keeps_other_fp_int(
 
     sdata.X = (
         sdata.X.filter(F.col('fp_int') == replace_id)
-        .withColumn('expression', F.lit(99.0))
+        .withColumn('expression', F.lit(99.0).cast('float'))
     )
     sdata.obs = sdata.obs.filter(F.col('fp_int') == replace_id)
     sdata.var = sdata.var.filter(F.col('fp_int') == replace_id)
