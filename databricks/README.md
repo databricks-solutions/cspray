@@ -62,8 +62,9 @@ your data and compute.
 The common case is a directory of files that have already been processed
 elsewhere — published atlases, or data a collaborator has already filtered and
 normalised — where the goal is a queryable set of tables that stay up to date.
-Use `cspray.ingest.run` for that (same call every day). Then load and sort out
-the metadata:
+Use `cspray.ingest.run` for that (same call every day). Keep
+`create_if_not_exists=True` on the job: first run creates the tables, later
+runs are incremental. Then load and sort out the metadata:
 
 ```
 import cspray as cs
@@ -78,6 +79,7 @@ cs.ingest.run(
     chunk_size=int(6_000_000),
     obs_metadata_columns='all',
     var_metadata_columns='all',
+    create_if_not_exists=True,  # first load if empty; same call every day after
 )
 
 sdata = SprayData.from_tables(

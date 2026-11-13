@@ -906,14 +906,47 @@ def _link_pair(dummy_h5ad_pair, dest):
     return paths
 
 
+def _run_kw(spark, path, tables):
+    return dict(
+        spark=spark, path=path,
+        table_base=tables, join_char='/', mode='delta',
+        from_raw=False, force_partitioning=2,
+        create_if_not_exists=True,
+    )
+
+
+def test_ingest_run_missing_sam_requires_flag(spark_collect, tmp_path):
+    with pytest.raises(ValueError, match='create_if_not_exists'):
+        ingest.run(
+            spark_collect,
+            path=str(tmp_path),
+            table_base=str(tmp_path / 'tables'),
+            join_char='/',
+            mode='delta',
+        )
+
+
+def test_ingest_run_x_without_sam_refuses_overwrite(
+    dummy_h5ad_pair, spark_collect, tmp_path
+):
+    paths = _link_pair(dummy_h5ad_pair, tmp_path / 'h5ads')
+    tables = str(tmp_path / 'tables')
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=paths, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    sdata.to_tables(
+        spark_collect, table_base=tables, join_char='/', subset=['X']
+    )
+    with pytest.raises(ValueError, match='exists'):
+        ingest.run(**_run_kw(spark_collect, str(tmp_path / 'h5ads'), tables))
+
+
 def test_ingest_run_second_pass_skips(dummy_h5ad_pair, spark_collect, tmp_path):
     paths = _link_pair(dummy_h5ad_pair, tmp_path / 'h5ads')
     tables = str(tmp_path / 'tables')
-    kw = dict(
-        spark=spark_collect, path=str(tmp_path / 'h5ads'),
-        table_base=tables, join_char='/', mode='delta',
-        from_raw=False, force_partitioning=2,
-    )
+    kw = _run_kw(spark_collect, str(tmp_path / 'h5ads'), tables)
     r1 = ingest.run(**kw)
     assert r1['n_new'] == 2 and r1['wrote']
     sam1 = {
@@ -936,11 +969,7 @@ def test_ingest_run_adds_new_file(dummy_h5ad_pair, spark_collect, tmp_path):
     a, b = dummy_h5ad_pair
     os.symlink(a, h5dir / 'a.h5ad')
     tables = str(tmp_path / 'tables')
-    kw = dict(
-        spark=spark_collect, path=str(h5dir),
-        table_base=tables, join_char='/', mode='delta',
-        from_raw=False, force_partitioning=2,
-    )
+    kw = _run_kw(spark_collect, str(h5dir), tables)
     r1 = ingest.run(**kw)
     assert r1['n_new'] == 1
     os.symlink(b, h5dir / 'b.h5ad')
@@ -969,11 +998,7 @@ def test_ingest_run_changed_file_keeps_other(dummy_h5ad_pair, spark_collect, tmp
     shutil.copy(dummy_h5ad_pair[0], a)
     shutil.copy(dummy_h5ad_pair[1], b)
     tables = str(tmp_path / 'tables')
-    kw = dict(
-        spark=spark_collect, path=str(h5dir),
-        table_base=tables, join_char='/', mode='delta',
-        from_raw=False, force_partitioning=2,
-    )
+    kw = _run_kw(spark_collect, str(h5dir), tables)
     ingest.run(**kw)
     ad.AnnData(
         X=csr_matrix(np.ones((3, 4), dtype='float32')),
@@ -1006,11 +1031,7 @@ def test_ingest_run_removed_file_kept(dummy_h5ad_pair, spark_collect, tmp_path):
     h5dir = tmp_path / 'h5ads'
     paths = _link_pair(dummy_h5ad_pair, h5dir)
     tables = str(tmp_path / 'tables')
-    kw = dict(
-        spark=spark_collect, path=str(h5dir),
-        table_base=tables, join_char='/', mode='delta',
-        from_raw=False, force_partitioning=2,
-    )
+    kw = _run_kw(spark_collect, str(h5dir), tables)
     ingest.run(**kw)
     os.unlink(paths[0])
     r2 = ingest.run(**kw)
@@ -1028,11 +1049,7 @@ def test_ingest_run_removed_file_kept(dummy_h5ad_pair, spark_collect, tmp_path):
 def test_ingest_run_force_rewrites_one(dummy_h5ad_pair, spark_collect, tmp_path):
     paths = _link_pair(dummy_h5ad_pair, tmp_path / 'h5ads')
     tables = str(tmp_path / 'tables')
-    kw = dict(
-        spark=spark_collect, path=str(tmp_path / 'h5ads'),
-        table_base=tables, join_char='/', mode='delta',
-        from_raw=False, force_partitioning=2,
-    )
+    kw = _run_kw(spark_collect, str(tmp_path / 'h5ads'), tables)
     ingest.run(**kw)
     before = {
         r.file_path: r.ingested_at

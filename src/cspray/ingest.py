@@ -117,16 +117,52 @@ def diff(
     return batch, stats
 
 
+def _table_name(table_base: str, join_char: str, name: str) -> str:
+    return table_base + join_char + name
+
+
+def _table_exists(spark, name: str, mode: str) -> bool:
+    """True if this ingest table is already in the lake. Must not ``read`` a
+    missing table — that is lazy on Databricks and fails on ``count()``.
+    """
+    if mode == 'delta':
+        from delta.tables import DeltaTable
+        return DeltaTable.isDeltaTable(spark, name)
+    return bool(spark.catalog.tableExists(name))
+
+
 def _load_sam(spark, table_base: str, join_char: str, mode: str):
     read_fn = DEFAULT_READERS[mode]
-    name = table_base + join_char + 'sam'
-    try:
-        df = read_fn(spark, name)
-    except Exception:
-        return None
-    if df.limit(1).count() == 0:
-        return None
-    return df
+    return read_fn(spark, _table_name(table_base, join_char, 'sam'))
+
+
+def _resolve_sam(spark, table_base: str, join_char: str, mode: str, create_if_not_exists: bool):
+    """Load ``sam``, or decide this is a first write.
+
+    * ``sam`` exists → incremental (even if ``create_if_not_exists`` is still on).
+    * neither ``sam`` nor ``X`` → first write only when ``create_if_not_exists``.
+    * ``X`` exists without ``sam`` → error; do not overwrite ``X``.
+    """
+    sam_name = _table_name(table_base, join_char, 'sam')
+    x_name = _table_name(table_base, join_char, 'X')
+    sam_exists = _table_exists(spark, sam_name, mode)
+    x_exists = _table_exists(spark, x_name, mode)
+
+    if sam_exists:
+        return _load_sam(spark, table_base, join_char, mode), False
+    if x_exists:
+        raise ValueError(
+            f'{sam_name} is missing but {x_name} exists. Will not overwrite. '
+            'Restore sam, or drop the tables and pass create_if_not_exists=True '
+            'for a full reload.'
+        )
+    if create_if_not_exists:
+        return None, True
+    raise ValueError(
+        f'{sam_name} does not exist. For a first load pass '
+        'create_if_not_exists=True (this writes every file). '
+        'Check table_base if you expected tables already.'
+    )
 
 
 def run(
@@ -139,6 +175,7 @@ def run(
     force: Optional[Force] = None,
     if_changed: str = 'replace',
     if_removed: str = 'keep',
+    create_if_not_exists: bool = False,
     **reader_kw: Any,
 ) -> Dict[str, Any]:
     """Ingest h5ads under ``path`` into ``table_base``.
@@ -146,9 +183,6 @@ def run(
     Same call every day. Files not yet in ``sam`` are always ingested. Files
     whose size and last-modified time still match ``sam`` are skipped, unless
     you name them in ``force``.
-
-    Day 1 (no ``sam`` table yet): writes all listed files (overwrite).
-    Later days: opens only the batch and replaces those files' rows.
 
     parameters:
     -----------
@@ -167,11 +201,16 @@ def run(
             force=7
             force=[7, '/data/b.h5ad']
 
-        For a full reload, drop the tables (or ``from_h5ads`` + overwrite) and
-        call ``run`` again. Do not pass every file to ``force``.
+        For a full reload, drop the tables and call ``run`` again with
+        ``create_if_not_exists=True``. Do not pass every file to ``force``.
     if_changed: only ``replace`` is implemented (re-write files whose size or
         last-modified time changed)
     if_removed: only ``keep`` is implemented (files gone from the directory stay in the lake)
+    create_if_not_exists: if True and no ``sam`` (and no ``X``) yet, this run
+        is the first load (overwrite, every file). If ``sam`` already exists,
+        the flag is ignored and the run is incremental — leave it on a
+        scheduled job. Default False: missing ``sam`` is an error, so an
+        interactive call cannot start a full ingest by accident.
     **reader_kw: forwarded to ``from_h5ads`` (e.g. from_raw, chunk_size). ``existing_sam``
         is ignored; this function loads it from the ``sam`` table.
     """
@@ -183,9 +222,10 @@ def run(
         raise ValueError("if_removed other than 'keep' is not implemented")
     reader_kw.pop('existing_sam', None)
 
+    sam, first_write = _resolve_sam(
+        spark, table_base, join_char, mode, create_if_not_exists,
+    )
     listing = construct_h5ad_path_df(path, df, spark)
-    sam = _load_sam(spark, table_base, join_char, mode)
-    first_write = sam is None
     batch, stats = diff(listing, sam, force=force)
     stats = dict(stats)
     stats['wrote'] = False

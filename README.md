@@ -79,7 +79,12 @@ These next two sections are different jobs:
 Use this when the h5ads are already processed (your own pipeline, a published
 atlas, a collaborator’s files). `ingest.run` only maintains the tables: new
 files are added, files that changed on disk are rewritten, unchanged files are
-left alone. Same call every day.
+left alone.
+
+Leave `create_if_not_exists=True` on the job. Day 1 (no tables) is a full
+write; every later run with the same call is incremental. Without that flag,
+a missing `sam` table is an error so you cannot start a full ingest by
+accident.
 
 ```
 import cspray as cs
@@ -89,6 +94,7 @@ cs.ingest.run(
     path='/data/h5ads',          # directory, one file, or a list of paths
     table_base='singlecell.bronze',
     from_raw=False,              # files are already processed
+    create_if_not_exists=True,   # first load if empty; ignored once tables exist
 )
 ```
 
@@ -97,7 +103,7 @@ table from scratch, which is the other example.
 
 To re-read a file that did not look changed (same size and last-modified time),
 pass it to `force=` by path or by `fp_int`. To reload the whole corpus, drop
-the tables and call `run` again.
+the tables and run the **same** job again (empty lake + `create_if_not_exists`).
 
 ## Minimal Example: run the cspray pipeline
 
