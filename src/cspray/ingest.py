@@ -241,6 +241,9 @@ def run(
         mode=mode,
         **reader_kw,
     )
+    # Ingest writes and drops the frames. Default persist=True would
+    # spark.catalog.clearCache() after to_tables; serverless rejects that.
+    sdata.set_intermediary_persistance(False)
     ids = [r.fp_int for r in sdata.sam.select('fp_int').collect()]
     replace_where = None if first_write else fp_int_predicate(ids)
     sdata.to_tables(
