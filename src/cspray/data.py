@@ -18,17 +18,45 @@ from .read import (
     read_var_from_h5ads,
     read_obs_from_h5ads,
     construct_h5ad_path_df,
-    ensure_fp_int,
+    assign_fp_int,
 )
 from typing import Optional, List, Dict, Any, Callable, Union
 import pyspark
 from pyspark.sql import functions as F
+from pyspark.sql import types as T
 import time
 import warnings
 
 from .write import DEFAULT_WRITERS
 from .read import DEFAULT_READERS
 from .utils import get_storage_level
+
+# Identity plus ingest signature. Promote / add_sample_metadata cannot overwrite
+# these; they are how a later run diffs the directory against the lake.
+SAM_IDENTITY_COLUMNS = ('fp_int', 'file_path')
+SAM_INGEST_COLUMNS = ('source_length', 'source_modified', 'ingested_at')
+SAM_REGISTRY_COLUMNS = SAM_IDENTITY_COLUMNS + SAM_INGEST_COLUMNS
+
+
+def sam_from_listing(listing: pyspark.sql.DataFrame) -> pyspark.sql.DataFrame:
+    """One row per file: fp_int, path, listing size/mtime, and ingest time.
+
+    ``source_length`` / ``source_modified`` are copied from the listing when
+    present (path-built listings always have them). A caller-supplied ``df``
+    that is only ``file_path`` still gets the columns, as nulls, so ``sam``
+    schema is stable. ``ingested_at`` is always now.
+    """
+    listing = assign_fp_int(listing)
+    cols = ['fp_int', 'file_path']
+    for c in ('source_length', 'source_modified'):
+        if c in listing.columns:
+            cols.append(c)
+    sam = listing.select(*cols).dropDuplicates(['fp_int', 'file_path'])
+    if 'source_length' not in sam.columns:
+        sam = sam.withColumn('source_length', F.lit(None).cast(T.LongType()))
+    if 'source_modified' not in sam.columns:
+        sam = sam.withColumn('source_modified', F.lit(None).cast(T.DoubleType()))
+    return sam.withColumn('ingested_at', F.current_timestamp())
 
 class SprayData:
     """
@@ -77,12 +105,30 @@ class SprayData:
         self.uns = uns
         self._file_mapping = None  # Cache for lazy loading
         self.write_order = [
-            'X','var','obs','sam','clu','sta'
+            'X','var','obs','clu','sta','sam'
         ]
         self.set_intermediary_persistance()
         if mode is None:
             mode = 'databricks'
         self.mode=mode
+
+    def _iter_tables(self, subset=None):
+        """``(name, df)`` for DataFrames on this object, in ``write_order``.
+
+        ``subset`` restricts names (still ordered by ``write_order``). Names
+        not in ``write_order`` raise. Slots that are not DataFrames are skipped.
+        """
+        if subset is None:
+            names = list(self.write_order)
+        else:
+            extra = [k for k in subset if k not in self.write_order]
+            if extra:
+                raise ValueError(f'subset not in write_order: {extra}')
+            names = sorted(subset, key=self.write_order.index)
+        for k in names:
+            df = getattr(self, k, None)
+            if isinstance(df, pyspark.sql.DataFrame):
+                yield k, df
 
     def set_intermediary_persistance(
         self,
@@ -162,6 +208,7 @@ class SprayData:
         var_metadata_columns: Optional[Union[str, List[str]]] = None,
         metadata_variant: Optional[bool] = True,
         metadata_chunk_size: Optional[int] = 50_000,
+        existing_sam: Optional[pyspark.sql.DataFrame] = None,
     ):
         """ Read h5ad files into SprayData object 
 
@@ -179,8 +226,10 @@ class SprayData:
         string). The processing pipeline continues to operate on the skinny key
         columns; the metadata column simply rides along on obs/var.
 
-        `sam` is seeded here from the file listing (fp_int, file_path), not from
-        obs, so writing sam does not recompute the cell table from HDF5.
+        `sam` is seeded here from the file listing (fp_int, file_path, size,
+        mtime) plus ingested_at, not from obs, so writing sam does not
+        recompute the cell table from HDF5. Those columns are the ingest
+        registry; promote/add_sample_metadata cannot overwrite them.
 
         parameters:
         -----------
@@ -198,11 +247,17 @@ class SprayData:
         var_metadata_columns: 'all' or list of var column names to capture into a `var_data` column. None (default) captures none.
         metadata_variant: if True (default) metadata columns are stored as VARIANT (needs Spark 3.5+/DBR 15.3+); if False they are kept as JSON strings.
         metadata_chunk_size: number of obs/var rows (cells/genes) read per chunk. Bounds per-worker memory independent of file size; files smaller than this read in a single chunk. None reads each file whole. Defaults to 50,000.
+        existing_sam: optional registry (at least file_path, fp_int). Hits keep
+            their id; new paths get max+1. None (default) numbers the listing
+            0, 1, … in path order.
         """
 
 
-        listing = ensure_fp_int(construct_h5ad_path_df(path, df, spark))
-        sam = listing.select('fp_int', 'file_path').distinct()
+        listing = assign_fp_int(
+            construct_h5ad_path_df(path, df, spark),
+            existing_sam=existing_sam,
+        )
+        sam = sam_from_listing(listing)
 
         X = read_expression_from_h5ads(
             spark,
@@ -272,6 +327,7 @@ class SprayData:
         subset:Optional[List]=None,
         partition: Optional[bool]=False,
         cluster: Optional[bool]=False,
+        replace_where: Optional[str]=None,
         ):
         """
         Write DataFrames in SprayData to tables in a Spark session.
@@ -287,9 +343,13 @@ class SprayData:
         subset : list, optional
             List of DataFrame names to write. Defaults to all in write_order.
         partition : bool, optional
-            If True, partitions tables on file_path. Defaults to True. Only applies to the bigger tables with cell idx: X,obs
+            If True, partitionBy file_path on tables that have that column.
         cluster : bool, optional
-            If True, clusters tables on cell_idx. Defaults to True.  Only applies to the bigger tables with cell idx: X,obs
+            If True, Z-order by cell_idx on tables that have that column.
+        replace_where : str, optional
+            Delta predicate (usually from ``fp_int_predicate``). None (default)
+            overwrites each table, including schema. Set, it replaces only
+            matching rows and cannot change schema.
 
         Returns
         -------
@@ -298,23 +358,19 @@ class SprayData:
         """
         if write_fn is None:
             write_fn = DEFAULT_WRITERS[self.mode]
-        
-        if subset is not None:
-            subset = sorted(subset, key=lambda x: self.write_order.index(x))
-        else:
-            subset = self.write_order
 
-        print("subset = ", subset)
+        print("subset = ", subset if subset is not None else self.write_order)
         out_subset = []
-        for k in subset:
+        for k, df in self._iter_tables(subset):
             t0 = time.time()
-            if isinstance(self.__dict__[k],pyspark.sql.DataFrame):
-                print(table_base+join_char+k)
-                if k in ['X','obs']:
-                    write_fn(spark, self.__dict__[k], table_base+join_char+k, partition=partition, cluster=cluster)
-                else:
-                    write_fn(spark, self.__dict__[k], table_base+join_char+k, partition=False, cluster=False)
-                out_subset.append(k)
+            print(table_base+join_char+k)
+            write_fn(
+                spark, df, table_base+join_char+k,
+                partition=bool(partition) and 'file_path' in df.columns,
+                cluster=bool(cluster) and 'cell_idx' in df.columns,
+                replace_where=replace_where,
+            )
+            out_subset.append(k)
             print("time elapsed = ", time.time()-t0)
 
         if self.persist_intermediaries:
@@ -371,6 +427,7 @@ class SprayData:
         subset:Optional[List]=None,
         partition: Optional[bool]=False,
         cluster: Optional[bool]=False,
+        replace_where: Optional[str]=None,
     ):
         """
         Write DataFrames in SprayData to tables and reset them by reloading from tables.
@@ -389,6 +446,8 @@ class SprayData:
             Character to join base name and table name. Defaults to '.'.
         subset : list, optional
             List of DataFrame names to write and reset. Defaults to all in write_order.
+        replace_where : str, optional
+            Forwarded to ``to_tables``. None (default) is a full overwrite.
         
         Returns
         -------
@@ -404,7 +463,8 @@ class SprayData:
             join_char=join_char, 
             subset=subset, 
             partition=partition,
-            cluster=cluster
+            cluster=cluster,
+            replace_where=replace_where,
         )
 
         # reset the ones that were saved

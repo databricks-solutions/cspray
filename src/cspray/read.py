@@ -1,5 +1,6 @@
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
+from pyspark.sql.window import Window
 import pyspark
 from typing import Iterator,Tuple,Optional,Union,List
 import h5py
@@ -650,14 +651,59 @@ def construct_h5ad_path_df(
     return df
 
 def ensure_fp_int(df: pyspark.sql.DataFrame) -> pyspark.sql.DataFrame:
-    """Add fp_int = hash(file_path) unless the listing already carries it."""
+    """Add fp_int = hash(file_path) unless the listing already carries it.
+
+    Not used by from_h5ads / assign_fp_int (those number 0, 1, …). Kept for
+    callers that still want a path hash.
+    """
     if 'fp_int' not in df.columns:
         df = df.withColumn('fp_int', F.hash('file_path'))
     return df
 
+def assign_fp_int(
+    listing: pyspark.sql.DataFrame,
+    existing_sam: Optional[pyspark.sql.DataFrame] = None,
+) -> pyspark.sql.DataFrame:
+    """Put ``fp_int`` on the listing.
+
+    * Listing already has ``fp_int`` → leave it (caller-injected).
+    * ``existing_sam is None`` or empty → ``0, 1, …`` in path order.
+    * Otherwise look up ``file_path`` in ``existing_sam``. Hits keep their id;
+      new paths get ``max(fp_int)+1`` upward, sorted by path. Never renumber.
+
+    The file list is small; ``max`` is one collect. New ids are a window over
+    unseen paths only.
+    """
+    if 'fp_int' in listing.columns:
+        return listing
+    if existing_sam is None:
+        existing_sam = listing.sparkSession.createDataFrame(
+            [], 'file_path string, fp_int int'
+        )
+
+    known = (
+        existing_sam
+        .select('file_path', F.col('fp_int').cast('int').alias('fp_int'))
+        .dropDuplicates(['file_path'])
+    )
+    max_id = known.agg(F.max('fp_int')).collect()[0][0]
+    next_id = 0 if max_id is None else int(max_id) + 1
+
+    attached = listing.join(F.broadcast(known), on='file_path', how='left')
+    is_new = F.col('fp_int').isNull()
+    kept = attached.filter(~is_new)
+    unseen = attached.filter(is_new).drop('fp_int').select('file_path').distinct()
+    w = Window.partitionBy(F.lit(0)).orderBy('file_path')
+    minted = unseen.withColumn(
+        'fp_int',
+        (F.row_number().over(w) - F.lit(1) + F.lit(next_id)).cast('int'),
+    )
+    newly = attached.filter(is_new).drop('fp_int').join(minted, on='file_path', how='inner')
+    return kept.unionByName(newly)
+
 def _file_identity_df(df: pyspark.sql.DataFrame) -> pyspark.sql.DataFrame:
     """Skinny (file_path, fp_int) used by the readers. Drops listing extras."""
-    return ensure_fp_int(df).select('file_path', 'fp_int').distinct()
+    return assign_fp_int(df).select('file_path', 'fp_int').distinct()
 
 _INSPECT_SCHEMA = T.StructType([
     T.StructField('file_path', T.StringType(), False),

@@ -1,14 +1,22 @@
 import os
 import json
 import math
+import shutil
 import pytest
 from scipy.sparse import coo_matrix
 from scipy import stats
 import numpy as np
 import pandas as pd
 
-from cspray.data import SprayData
-from cspray.read import _explode_nnz_ranges, construct_h5ad_path_df, inspect_h5ads
+from cspray.data import SAM_REGISTRY_COLUMNS, SprayData, sam_from_listing
+from cspray.read import (
+    _explode_nnz_ranges,
+    assign_fp_int,
+    construct_h5ad_path_df,
+    inspect_h5ads,
+)
+from cspray.write import fp_int_predicate
+from cspray import ingest
 import cspray as cs
 from pyspark.sql import functions as F
 
@@ -195,7 +203,7 @@ def test_metadata_dummy_roundtrip(dummy_h5ad_pair, spark_collect):
     # 1. sam exists immediately at one row per input file -------------------
     sam = sdata.sam.toPandas()
     assert len(sam) == 2
-    assert set(sam.columns) == {'fp_int', 'file_path'}
+    assert set(sam.columns) == set(SAM_REGISTRY_COLUMNS)
     assert set(sam['file_path']) == set(dummy_h5ad_pair)
 
     # 2. every cell carries metadata, keyed to the right barcode ------------
@@ -546,19 +554,516 @@ def test_listing_path_and_df_rejected(dummy_h5ad_categorical_index, spark_collec
             path=dummy_h5ad_categorical_index, df=incoming, spark=spark_collect
         )
 
+def test_write_order_sam_last():
+    """X first (fail-fast); sam last so a crash still looks uningested."""
+    sdata = SprayData()
+    assert sdata.write_order[0] == 'X'
+    assert sdata.write_order[-1] == 'sam'
+    assert sdata.write_order == ['X', 'var', 'obs', 'clu', 'sta', 'sam']
+
+
+def _spy_writes():
+    written = []
+    def write_fn(spark, df, name, partition=False, cluster=False, replace_where=None):
+        written.append({
+            'name': name,
+            'partition': partition,
+            'cluster': cluster,
+            'replace_where': replace_where,
+            'columns': list(df.columns),
+        })
+    return written, write_fn
+
+
+def test_to_tables_writes_present_frames_in_order(dummy_h5ad_pair, spark_collect):
+    """None slots (clu/sta) are skipped; X first, sam last."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    written, spy = _spy_writes()
+    out = sdata.to_tables(
+        spark_collect, write_fn=spy, table_base='t', join_char='_'
+    )
+    assert out == ['X', 'var', 'obs', 'sam']
+    assert [w['name'] for w in written] == ['t_X', 't_var', 't_obs', 't_sam']
+    assert all(not w['partition'] and not w['cluster'] for w in written)
+
+
+def test_to_tables_writes_extra_slot_before_sam(dummy_h5ad_pair, spark_collect):
+    """A later table (obsm/layers) just joins write_order ahead of sam."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    sdata.obsm = sdata.obs
+    sdata.write_order = ['X', 'var', 'obs', 'obsm', 'clu', 'sta', 'sam']
+    written, spy = _spy_writes()
+    out = sdata.to_tables(
+        spark_collect, write_fn=spy, table_base='t', join_char='_'
+    )
+    assert out == ['X', 'var', 'obs', 'obsm', 'sam']
+    assert out[0] == 'X'
+    assert out[-1] == 'sam'
+    assert out.index('obsm') < out.index('sam')
+    assert [w['name'] for w in written] == [
+        't_X', 't_var', 't_obs', 't_obsm', 't_sam'
+    ]
+
+
+def test_to_tables_partition_cluster_follow_columns(dummy_h5ad_pair, spark_collect):
+    """Flags apply by column, not by a hardcoded ['X','obs'] name list."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    written, spy = _spy_writes()
+    sdata.to_tables(
+        spark_collect, write_fn=spy, table_base='t', join_char='_',
+        partition=True, cluster=True,
+    )
+    by = {w['name']: w for w in written}
+    assert by['t_X']['partition'] and by['t_X']['cluster']
+    assert by['t_obs']['partition'] and by['t_obs']['cluster']
+    assert by['t_var']['partition'] and not by['t_var']['cluster']
+    assert by['t_sam']['partition'] and not by['t_sam']['cluster']
+
+
+def test_to_tables_subset_unknown_raises():
+    sdata = SprayData()
+    with pytest.raises(ValueError, match='not in write_order'):
+        sdata.to_tables(None, write_fn=lambda *a, **k: None, subset=['obsm'])
+
+
 def test_sam_from_listing_not_obs(dummy_h5ad_pair, spark_collect):
     """sam is one row per file from the listing, not distinct obs cells."""
     sdata = SprayData.from_h5ads(
         spark_collect, path=dummy_h5ad_pair, from_raw=False,
         mode='delta', force_partitioning=2,
     )
-    assert set(sdata.sam.columns) == {'fp_int', 'file_path'}
+    assert set(sdata.sam.columns) == set(SAM_REGISTRY_COLUMNS)
     sam = sdata.sam.toPandas()
     assert len(sam) == 2
     assert set(sam['file_path']) == set(dummy_h5ad_pair)
     assert sdata.obs.count() == 6
     x_ids = {r.fp_int for r in sdata.X.select('fp_int').distinct().collect()}
     assert x_ids == set(sam['fp_int'])
+    by_path = {r.file_path: r for r in sdata.sam.collect()}
+    for p in dummy_h5ad_pair:
+        _assert_listing_matches_stat(by_path[p], p)
+        assert by_path[p].ingested_at is not None
+    ordered = sorted(dummy_h5ad_pair)
+    assert by_path[ordered[0]].fp_int == 0
+    assert by_path[ordered[1]].fp_int == 1
+
+
+def test_sam_from_listing_helper_copies_signature(dummy_h5ad_categorical_index, spark_collect):
+    listing = construct_h5ad_path_df(
+        path=dummy_h5ad_categorical_index, spark=spark_collect
+    )
+    listing = listing.withColumn('fp_int', F.lit(7).cast('int'))
+    sam = sam_from_listing(listing)
+    assert set(sam.columns) == set(SAM_REGISTRY_COLUMNS)
+    row = sam.collect()[0]
+    assert row.fp_int == 7
+    _assert_listing_matches_stat(row, dummy_h5ad_categorical_index)
+    assert row.ingested_at is not None
+
+
+def test_sam_from_path_only_df_has_null_signature(dummy_h5ad_categorical_index, spark_collect):
+    incoming = spark_collect.createDataFrame(
+        [(dummy_h5ad_categorical_index,)], ['file_path']
+    )
+    sam = sam_from_listing(incoming)
+    row = sam.collect()[0]
+    assert row.file_path == dummy_h5ad_categorical_index
+    assert row.source_length is None
+    assert row.source_modified is None
+    assert row.ingested_at is not None
+    assert row.fp_int == 0
+
+
+def test_sam_registry_columns_not_overwritten(dummy_h5ad_pair, spark_collect):
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    before = (
+        sdata.sam.select('file_path', 'source_length').toPandas()
+        .sort_values('file_path').reset_index(drop=True)
+    )
+    poison = spark_collect.createDataFrame(
+        [(dummy_h5ad_pair[0], 1), (dummy_h5ad_pair[1], 2)],
+        ['file_path', 'source_length'],
+    )
+    with pytest.raises(ValueError, match='registry columns'):
+        cs.md.add_sample_metadata(sdata, poison)
+    after = (
+        sdata.sam.select('file_path', 'source_length').toPandas()
+        .sort_values('file_path').reset_index(drop=True)
+    )
+    assert after.equals(before)
+
+def test_assign_fp_int_none_matches_empty_registry(spark_collect):
+    listing = spark_collect.createDataFrame(
+        [('/tmp/b.h5ad',), ('/tmp/a.h5ad',)], ['file_path']
+    )
+    empty = spark_collect.createDataFrame([], 'file_path string, fp_int int')
+    from_none = {r.file_path: r.fp_int for r in assign_fp_int(listing).collect()}
+    from_empty = {r.file_path: r.fp_int for r in assign_fp_int(listing, empty).collect()}
+    assert from_none == from_empty == {'/tmp/a.h5ad': 0, '/tmp/b.h5ad': 1}
+
+
+def test_assign_fp_int_keeps_hits_and_increments(spark_collect):
+    listing = spark_collect.createDataFrame(
+        [('/tmp/a.h5ad',), ('/tmp/b.h5ad',), ('/tmp/c.h5ad',)],
+        ['file_path'],
+    )
+    existing = spark_collect.createDataFrame(
+        [('/tmp/a.h5ad', 7)], ['file_path', 'fp_int']
+    )
+    out = {r.file_path: r.fp_int for r in assign_fp_int(listing, existing).collect()}
+    assert out['/tmp/a.h5ad'] == 7
+    assert out['/tmp/b.h5ad'] == 8
+    assert out['/tmp/c.h5ad'] == 9
+
+
+def test_assign_fp_int_never_renumbers(spark_collect):
+    listing = spark_collect.createDataFrame([('/tmp/a.h5ad',)], ['file_path'])
+    existing = spark_collect.createDataFrame(
+        [('/tmp/a.h5ad', 7)], ['file_path', 'fp_int']
+    )
+    again = assign_fp_int(listing, existing).collect()[0].fp_int
+    assert again == 7
+
+
+def test_from_h5ads_existing_sam_keeps_fp_int(dummy_h5ad_pair, spark_collect):
+    a, b = sorted(dummy_h5ad_pair)
+    existing = spark_collect.createDataFrame([(a, 7)], ['file_path', 'fp_int'])
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2, existing_sam=existing,
+    )
+    by_path = {r.file_path: r.fp_int for r in sdata.sam.collect()}
+    assert by_path[a] == 7
+    assert by_path[b] == 8
+    assert {r.fp_int for r in sdata.X.select('fp_int').distinct().collect()} == {7, 8}
+
+
+def test_fp_int_predicate_range_and_in():
+    assert fp_int_predicate([7]) == 'fp_int = 7'
+    assert fp_int_predicate([10, 11, 12]) == 'fp_int BETWEEN 10 AND 12'
+    assert fp_int_predicate([1, 3, 5]) == 'fp_int IN (1, 3, 5)'
+    assert fp_int_predicate([0, 1, 2, 5, 9]) == (
+        '(fp_int BETWEEN 0 AND 2) OR (fp_int IN (5, 9))'
+    )
+
+
+def test_fp_int_predicate_empty_raises():
+    with pytest.raises(ValueError, match='at least one fp_int'):
+        fp_int_predicate([])
+
+
+def test_to_tables_default_overwrite_wipes_other_files(
+    dummy_h5ad_pair, spark_collect, tmp_path
+):
+    """No replace_where still replaces the whole table."""
+    spark = spark_collect
+    table_base = str(tmp_path)
+    sdata = SprayData.from_h5ads(
+        spark, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    sdata.to_tables(spark, table_base=table_base, join_char='/')
+
+    keep = 0
+    sdata.X = sdata.X.filter(F.col('fp_int') == keep)
+    sdata.obs = sdata.obs.filter(F.col('fp_int') == keep)
+    sdata.var = sdata.var.filter(F.col('fp_int') == keep)
+    sdata.sam = sdata.sam.filter(F.col('fp_int') == keep)
+    sdata.to_tables(spark, table_base=table_base, join_char='/')
+
+    loaded = SprayData.from_tables(
+        spark, table_base=table_base, join_char='/', mode='delta'
+    )
+    assert {r.fp_int for r in loaded.X.select('fp_int').distinct().collect()} == {keep}
+    assert {r.fp_int for r in loaded.sam.select('fp_int').distinct().collect()} == {keep}
+
+
+def test_replace_where_keeps_other_fp_int(
+    dummy_h5ad_pair, spark_collect, tmp_path
+):
+    """replaceWhere on one fp_int leaves the other file's rows in place."""
+    spark = spark_collect
+    table_base = str(tmp_path)
+    sdata = SprayData.from_h5ads(
+        spark, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    sdata.to_tables(spark, table_base=table_base, join_char='/')
+
+    ids = sorted({r.fp_int for r in sdata.sam.select('fp_int').collect()})
+    replace_id, keep_id = ids[0], ids[1]
+    keep_obs = sdata.obs.filter(F.col('fp_int') == keep_id).count()
+
+    sdata.X = (
+        sdata.X.filter(F.col('fp_int') == replace_id)
+        .withColumn('expression', F.lit(99.0).cast('float'))
+    )
+    sdata.obs = sdata.obs.filter(F.col('fp_int') == replace_id)
+    sdata.var = sdata.var.filter(F.col('fp_int') == replace_id)
+    sdata.sam = sdata.sam.filter(F.col('fp_int') == replace_id)
+    sdata.to_tables_and_reset(
+        spark, table_base=table_base, join_char='/',
+        replace_where=fp_int_predicate([replace_id]),
+    )
+
+    assert {r.fp_int for r in sdata.X.select('fp_int').distinct().collect()} == {
+        replace_id, keep_id
+    }
+    exprs = {
+        r.expression
+        for r in sdata.X.filter(F.col('fp_int') == replace_id)
+        .select('expression').distinct().collect()
+    }
+    assert exprs == {99.0}
+    assert sdata.obs.filter(F.col('fp_int') == keep_id).count() == keep_obs
+    keep_exprs = {
+        r.expression
+        for r in sdata.X.filter(F.col('fp_int') == keep_id)
+        .select('expression').distinct().collect()
+    }
+    assert 99.0 not in keep_exprs
+
+
+def test_ingest_diff_classifies(spark_collect):
+    listing = spark_collect.createDataFrame(
+        [('/a.h5ad', 10, 1.0), ('/b.h5ad', 20, 2.0), ('/c.h5ad', 30, 3.0)],
+        ['file_path', 'source_length', 'source_modified'],
+    )
+    sam = spark_collect.createDataFrame(
+        [
+            (0, '/a.h5ad', 10, 1.0),
+            (1, '/b.h5ad', 99, 2.0),
+            (2, '/gone.h5ad', 1, 0.0),
+        ],
+        ['fp_int', 'file_path', 'source_length', 'source_modified'],
+    )
+    batch, stats = ingest.diff(listing, sam)
+    assert {r.file_path for r in batch.collect()} == {'/b.h5ad', '/c.h5ad'}
+    assert stats == {'n_new': 1, 'n_changed': 1, 'n_skipped': 1, 'n_forced': 0}
+
+
+def test_ingest_diff_force_path_and_fp_int(spark_collect):
+    listing = spark_collect.createDataFrame(
+        [('/a.h5ad', 10, 1.0), ('/b.h5ad', 20, 2.0)],
+        ['file_path', 'source_length', 'source_modified'],
+    )
+    sam = spark_collect.createDataFrame(
+        [(0, '/a.h5ad', 10, 1.0), (1, '/b.h5ad', 20, 2.0)],
+        ['fp_int', 'file_path', 'source_length', 'source_modified'],
+    )
+    batch, stats = ingest.diff(listing, sam, force=['/a.h5ad'])
+    assert {r.file_path for r in batch.collect()} == {'/a.h5ad'}
+    assert stats['n_forced'] == 1
+    assert stats['n_skipped'] == 1
+    batch, stats = ingest.diff(listing, sam, force=[1])
+    assert {r.file_path for r in batch.collect()} == {'/b.h5ad'}
+    assert stats['n_forced'] == 1
+
+
+def test_ingest_diff_no_sam_is_all_new(spark_collect):
+    listing = spark_collect.createDataFrame(
+        [('/a.h5ad', 10, 1.0)],
+        ['file_path', 'source_length', 'source_modified'],
+    )
+    batch, stats = ingest.diff(listing, None)
+    assert batch.count() == 1
+    assert stats['n_new'] == 1
+    assert stats['n_skipped'] == 0
+
+
+def test_ingest_run_rejects_unimplemented_flags():
+    with pytest.raises(ValueError, match='if_changed'):
+        ingest.run(None, if_changed='skip')
+    with pytest.raises(ValueError, match='if_removed'):
+        ingest.run(None, if_removed='drop')
+
+
+def _link_pair(dummy_h5ad_pair, dest):
+    dest.mkdir()
+    paths = []
+    for src in dummy_h5ad_pair:
+        p = dest / os.path.basename(src)
+        os.symlink(src, p)
+        paths.append(str(p))
+    return paths
+
+
+def _run_kw(spark, path, tables):
+    return dict(
+        spark=spark, path=path,
+        table_base=tables, join_char='/', mode='delta',
+        from_raw=False, force_partitioning=2,
+        create_if_not_exists=True,
+    )
+
+
+def test_ingest_run_missing_sam_requires_flag(spark_collect, tmp_path):
+    with pytest.raises(ValueError, match='create_if_not_exists'):
+        ingest.run(
+            spark_collect,
+            path=str(tmp_path),
+            table_base=str(tmp_path / 'tables'),
+            join_char='/',
+            mode='delta',
+        )
+
+
+def test_ingest_run_x_without_sam_refuses_overwrite(
+    dummy_h5ad_pair, spark_collect, tmp_path
+):
+    paths = _link_pair(dummy_h5ad_pair, tmp_path / 'h5ads')
+    tables = str(tmp_path / 'tables')
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=paths, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    sdata.to_tables(
+        spark_collect, table_base=tables, join_char='/', subset=['X']
+    )
+    with pytest.raises(ValueError, match='exists'):
+        ingest.run(**_run_kw(spark_collect, str(tmp_path / 'h5ads'), tables))
+
+
+def test_ingest_run_second_pass_skips(dummy_h5ad_pair, spark_collect, tmp_path):
+    paths = _link_pair(dummy_h5ad_pair, tmp_path / 'h5ads')
+    tables = str(tmp_path / 'tables')
+    kw = _run_kw(spark_collect, str(tmp_path / 'h5ads'), tables)
+    r1 = ingest.run(**kw)
+    assert r1['n_new'] == 2 and r1['wrote']
+    sam1 = {
+        r.file_path: r.ingested_at
+        for r in spark_collect.read.format('delta').load(tables + '/sam').collect()
+    }
+    r2 = ingest.run(**kw)
+    assert r2['n_skipped'] == 2 and not r2['wrote']
+    sam2 = {
+        r.file_path: r.ingested_at
+        for r in spark_collect.read.format('delta').load(tables + '/sam').collect()
+    }
+    assert sam1 == sam2
+    assert set(sam1) == set(paths)
+
+
+def test_ingest_run_adds_new_file(dummy_h5ad_pair, spark_collect, tmp_path):
+    h5dir = tmp_path / 'h5ads'
+    h5dir.mkdir()
+    a, b = dummy_h5ad_pair
+    os.symlink(a, h5dir / 'a.h5ad')
+    tables = str(tmp_path / 'tables')
+    kw = _run_kw(spark_collect, str(h5dir), tables)
+    r1 = ingest.run(**kw)
+    assert r1['n_new'] == 1
+    os.symlink(b, h5dir / 'b.h5ad')
+    r2 = ingest.run(**kw)
+    assert r2['n_new'] == 1 and r2['n_skipped'] == 1 and r2['wrote']
+    sam = spark_collect.read.format('delta').load(tables + '/sam')
+    assert sam.count() == 2
+    ids = {r.fp_int for r in sam.collect()}
+    assert ids == {0, 1}
+    x_ids = {
+        r.fp_int
+        for r in spark_collect.read.format('delta').load(tables + '/X')
+        .select('fp_int').distinct().collect()
+    }
+    assert x_ids == {0, 1}
+
+
+def test_ingest_run_changed_file_keeps_other(dummy_h5ad_pair, spark_collect, tmp_path):
+    import anndata as ad
+    from scipy.sparse import csr_matrix
+
+    h5dir = tmp_path / 'h5ads'
+    h5dir.mkdir()
+    a = h5dir / 'a.h5ad'
+    b = h5dir / 'b.h5ad'
+    shutil.copy(dummy_h5ad_pair[0], a)
+    shutil.copy(dummy_h5ad_pair[1], b)
+    tables = str(tmp_path / 'tables')
+    kw = _run_kw(spark_collect, str(h5dir), tables)
+    ingest.run(**kw)
+    ad.AnnData(
+        X=csr_matrix(np.ones((3, 4), dtype='float32')),
+        obs=pd.DataFrame(index=['c0', 'c1', 'c2']),
+        var=pd.DataFrame(index=['g0', 'g1', 'g2', 'g3']),
+    ).write(a)
+    r2 = ingest.run(**kw)
+    assert r2['n_changed'] == 1 and r2['n_skipped'] == 1
+    X = spark_collect.read.format('delta').load(tables + '/X')
+    a_id = (
+        spark_collect.read.format('delta').load(tables + '/sam')
+        .filter(F.col('file_path').endswith('a.h5ad'))
+        .collect()[0].fp_int
+    )
+    b_id = 1 - a_id
+    a_expr = {
+        r.expression
+        for r in X.filter(F.col('fp_int') == a_id).select('expression').distinct().collect()
+    }
+    assert a_expr == {1.0}
+    b_expr = {
+        r.expression
+        for r in X.filter(F.col('fp_int') == b_id).select('expression').distinct().collect()
+    }
+    assert 1.0 not in b_expr
+    assert X.select('fp_int').distinct().count() == 2
+
+
+def test_ingest_run_removed_file_kept(dummy_h5ad_pair, spark_collect, tmp_path):
+    h5dir = tmp_path / 'h5ads'
+    paths = _link_pair(dummy_h5ad_pair, h5dir)
+    tables = str(tmp_path / 'tables')
+    kw = _run_kw(spark_collect, str(h5dir), tables)
+    ingest.run(**kw)
+    os.unlink(paths[0])
+    r2 = ingest.run(**kw)
+    assert r2['n_skipped'] == 1 and not r2['wrote']
+    sam = spark_collect.read.format('delta').load(tables + '/sam')
+    assert sam.count() == 2
+    x_ids = {
+        r.fp_int
+        for r in spark_collect.read.format('delta').load(tables + '/X')
+        .select('fp_int').distinct().collect()
+    }
+    assert len(x_ids) == 2
+
+
+def test_ingest_run_force_rewrites_one(dummy_h5ad_pair, spark_collect, tmp_path):
+    paths = _link_pair(dummy_h5ad_pair, tmp_path / 'h5ads')
+    tables = str(tmp_path / 'tables')
+    kw = _run_kw(spark_collect, str(tmp_path / 'h5ads'), tables)
+    ingest.run(**kw)
+    before = {
+        r.file_path: r.ingested_at
+        for r in spark_collect.read.format('delta').load(tables + '/sam').collect()
+    }
+    r2 = ingest.run(**kw, force=paths[0])
+    assert r2['n_forced'] == 1 and r2['n_skipped'] == 1 and r2['wrote']
+    after = {
+        r.file_path: r.ingested_at
+        for r in spark_collect.read.format('delta').load(tables + '/sam').collect()
+    }
+    assert after[paths[0]] != before[paths[0]]
+    assert after[paths[1]] == before[paths[1]]
+
 
 def test_injected_fp_int_used_everywhere(dummy_h5ad_categorical_index, spark_collect):
     """If the listing already has fp_int, do not re-hash; X/obs/var/sam all use it."""
