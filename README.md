@@ -180,11 +180,27 @@ cs.md.promote_suggested(sdata, which='both', promote_sam=True)
 
 
 ### Run tests
-From the root dir, pip install the test environment and run tests: 
+
+**Databricks** (classic or serverless). Spark/Delta are already on the runtime.
+Do not install `[local]` on a cluster.
+
 ```
-    ~$: pip install .[test]
-    ~$: sh run_tests.sh
+pip install -e '.[test]'
+sh run_tests.sh
 ```
+
+**Laptop.** JDK 17+ and `JAVA_HOME`. Python 3.12. Create a venv once and reuse
+it (`-e` picks up `src/` edits; reinstall only if `pyproject.toml` deps change).
+
+```
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[local,test]'
+python -m pytest tests/unit
+```
+
+`sh run_tests.sh` also runs `tests/integration` (census download + Scanpy vs cspray).
+Laptop `[local]` starts Spark with Delta for write tests; clusters already have it.
 
 ## License
 
