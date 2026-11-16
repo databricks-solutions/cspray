@@ -27,12 +27,13 @@ test = [
     "pytest",
 ]
 # Laptop / OSS Spark. Do not install this extra on a Databricks cluster.
+# Spark 4 + Delta 4 (GroupedData.applyInArrow; matches DBR 18 / serverless 6).
 # pyarrow cap: a blank venv with numpy<2 otherwise pulls latest pyarrow,
 # which needs numpy 2. Classic/serverless keep the runtime's pyarrow.
 local = [
-    "pyspark>=3.5,<4",
-    "delta-spark>=3.3,<3.4",
-    "pyarrow>=17,<18",
+    "pyspark>=4.0.1,<4.3",
+    "delta-spark>=4,<5",
+    "pyarrow>=18,<22",
     "setuptools",  # pyspark.ml still imports distutils; gone in Python 3.12
 ]
 
