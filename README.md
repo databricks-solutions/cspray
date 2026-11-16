@@ -180,11 +180,27 @@ cs.md.promote_suggested(sdata, which='both', promote_sam=True)
 
 
 ### Run tests
-From the root dir, pip install the test environment and run tests: 
+
+**Databricks** (classic or serverless). Spark/Delta are already on the runtime.
+Do not install `[local]` on a cluster.
+
 ```
-    ~$: pip install .[test]
-    ~$: sh run_tests.sh
+pip install -e '.[test]'
+sh run_tests.sh
 ```
+
+**Laptop.** JDK 17+ and `JAVA_HOME`. Python 3.12. Create a venv once and reuse
+it (`-e` picks up `src/` edits; reinstall only if `pyproject.toml` deps change).
+
+```
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[local,test]'
+python -m pytest tests/integration/test_integration.py -k "test_fp_int_predicate or test_ingest_diff or test_listing_ or test_assign_fp_int or test_write_order_sam_last or test_to_tables_writes_present_frames_in_order or test_to_tables_subset_unknown_raises or test_ingest_run_rejects_unimplemented"
+```
+
+Write tests need Delta on the Spark session (Ivy `--packages` /
+`configure_spark_with_delta_pip`). Clusters already have it.
 
 ## License
 

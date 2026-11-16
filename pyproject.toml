@@ -22,8 +22,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# pytest only — safe on Databricks classic (cluster already has Spark/Delta).
 test = [
     "pytest",
+]
+# Laptop / OSS Spark. Do not install this extra on a Databricks cluster.
+# pyarrow cap: a blank venv with numpy<2 otherwise pulls latest pyarrow,
+# which needs numpy 2. Classic/serverless keep the runtime's pyarrow.
+local = [
+    "pyspark>=3.5,<4",
+    "delta-spark>=3.3,<3.4",
+    "pyarrow>=17,<18",
+    "setuptools",  # pyspark.ml still imports distutils; gone in Python 3.12
 ]
 
 [tool.setuptools]
