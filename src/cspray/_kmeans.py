@@ -81,8 +81,7 @@ def apply_kmeans(sdata: SprayData, ks:List[int], seed:int=0,max_iter:int=20):
         sdfs
     )
     
-    if sdata.persist_intermediaries:
-        cluster_df.persist(sdata.persist_storage_level)
+    cluster_df = sdata.persist_df(cluster_df)
 
     score_tuples=[(fp, k, score) for fp, scores_values in scores.items() for k, score in zip(ks,scores_values)]
     scores_pdf = pd.DataFrame(score_tuples, columns=['file_path','k','score'])

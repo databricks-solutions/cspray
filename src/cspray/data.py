@@ -104,6 +104,7 @@ class SprayData:
         self.sta = sta
         self.uns = uns
         self._file_mapping = None  # Cache for lazy loading
+        self._persisted = []
         self.write_order = [
             'X','var','obs','clu','sta','sam'
         ]
@@ -157,6 +158,39 @@ class SprayData:
         self.persist_intermediaries = persist
         self.persist_storage_level = get_storage_level(storage_level)
         self.materialize_off_route = materialize_off_route
+
+    def persist_df(self, df):
+        """Persist ``df`` when intermediaries are on, and remember it for release.
+
+        No-op when persist is off. Callers must use the returned frame.
+        On serverless (env 5+) this is an eager session snapshot; storage
+        level is ignored. ``unpersist`` there destroys the DataFrame and
+        anything derived from it, so only release a frame you are finished
+        with (metadata's local explode) or after ``to_tables_and_reset``
+        has replaced the live slots from tables.
+        """
+        if df is None or not self.persist_intermediaries:
+            return df
+        df = df.persist(self.persist_storage_level)
+        self._persisted.append(df)
+        return df
+
+    def unpersist_df(self, df):
+        """Drop one remembered snapshot. For a local frame you are done with."""
+        if df is None:
+            return
+        df.unpersist()
+        self._persisted = [x for x in self._persisted if x is not df]
+
+    def release_intermediaries(self):
+        """Unpersist frames recorded by ``persist_df``.
+
+        Call after ``to_tables_and_reset`` (slots replaced). Do not call
+        after ``to_tables`` while ``sdata.X`` still hangs off these frames.
+        """
+        for df in self._persisted:
+            df.unpersist()
+        self._persisted = []
 
     @property
     def file_mapping(self):
@@ -373,8 +407,6 @@ class SprayData:
             out_subset.append(k)
             print("time elapsed = ", time.time()-t0)
 
-        if self.persist_intermediaries:
-            spark.catalog.clearCache()
         return out_subset
         
     
@@ -466,6 +498,10 @@ class SprayData:
             cluster=cluster,
             replace_where=replace_where,
         )
+
+        # Live slots are about to be replaced from tables. Safe on OSS and
+        # serverless: we will not query the old frames after this.
+        self.release_intermediaries()
 
         # reset the ones that were saved
         for k in subset:

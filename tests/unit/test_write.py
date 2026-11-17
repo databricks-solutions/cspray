@@ -82,6 +82,40 @@ def test_to_tables_partition_cluster_follow_columns(dummy_h5ad_pair, spark_colle
     assert by['t_sam']['partition'] and not by['t_sam']['cluster']
 
 
+def test_to_tables_does_not_clear_cache(dummy_h5ad_pair, spark_collect, monkeypatch):
+    """Serverless rejects SQL CLEAR CACHE; persist-on must not call it."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(True)
+    def boom(*a, **k):
+        raise AssertionError('spark.catalog.clearCache must not run')
+    monkeypatch.setattr(spark_collect.catalog, 'clearCache', boom)
+    written, spy = _spy_writes()
+    sdata.to_tables(spark_collect, write_fn=spy, table_base='t', join_char='_')
+    assert written
+
+
+def test_to_tables_and_reset_releases_intermediaries(
+    dummy_h5ad_pair, spark_collect, tmp_path
+):
+    """After reset, tracked snapshots are unpersisted; new slots still query."""
+    spark = spark_collect
+    table_base = str(tmp_path)
+    sdata = SprayData.from_h5ads(
+        spark, path=dummy_h5ad_pair, from_raw=False,
+        mode='delta', force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(True)
+    held = sdata.persist_df(sdata.obs.limit(1))
+    assert held.is_cached
+    assert sdata._persisted
+    sdata.to_tables_and_reset(spark, table_base=table_base, join_char='/')
+    assert sdata._persisted == []
+    assert sdata.obs.count() > 0
+
+
 def test_to_tables_subset_unknown_raises():
     sdata = SprayData()
     with pytest.raises(ValueError, match='not in write_order'):
