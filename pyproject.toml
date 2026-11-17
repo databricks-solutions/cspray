@@ -12,8 +12,8 @@ dependencies = [
    "scanpy>=1.11.0",
    "bbknn>=1.5",
    "pyspark",
-   "pyarrow>=1.14",
-   "numpy<2",
+   "pyarrow>=18",
+   "numpy",
    "scipy>1.15",
    "pooch",
    "pybiomart",
@@ -27,13 +27,11 @@ test = [
     "pytest",
 ]
 # Laptop / OSS Spark. Do not install this extra on a Databricks cluster.
-# Spark 4 + Delta 4 (GroupedData.applyInArrow; matches DBR 18 / serverless 6).
-# pyarrow cap: a blank venv with numpy<2 otherwise pulls latest pyarrow,
-# which needs numpy 2. Classic/serverless keep the runtime's pyarrow.
+# Spark 4 + Delta 4
 local = [
     "pyspark>=4.0.1,<4.3",
     "delta-spark>=4,<5",
-    "pyarrow>=18,<22",
+    "pyarrow>=18",
     "setuptools",  # pyspark.ml still imports distutils; gone in Python 3.12
 ]
 
