@@ -241,8 +241,7 @@ def run(
         mode=mode,
         **reader_kw,
     )
-    # Ingest writes and drops the frames. Snapshot persist would pay for
-    # X/obs/var with no reuse. Stay off on classic and serverless.
+    # Write-and-drop: no later action reuses these frames.
     sdata.set_intermediary_persistance(False)
     ids = [r.fp_int for r in sdata.sam.select('fp_int').collect()]
     replace_where = None if first_write else fp_int_predicate(ids)

@@ -349,9 +349,6 @@ def profile(
 
     exploded = payload.mapInPandas(_explode_partition, schema=_EXPLODE_SCHEMA)
 
-    # Persist for reuse across the summary / per-file / examples passes.
-    # Off: recompute exploded on those passes. On: local snapshot; unpersist
-    # in finally — exploded is not a live sdata slot.
     exploded = sdata.persist_df(exploded)
 
     try:
