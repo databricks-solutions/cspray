@@ -349,13 +349,7 @@ def profile(
 
     exploded = payload.mapInPandas(_explode_partition, schema=_EXPLODE_SCHEMA)
 
-    # Persist for reuse across the summary / per-file / examples passes, but only
-    # when the SprayData allows it. Serverless compute rejects cache()/persist()
-    # ("PERSIST TABLE is not supported"), so honour persist_intermediaries and
-    # simply recompute exploded on those passes when persistence is disabled.
-    persisted = getattr(sdata, "persist_intermediaries", False)
-    if persisted:
-        exploded = exploded.persist(sdata.persist_storage_level)
+    exploded = sdata.persist_df(exploded)
 
     try:
         total = df.count()
@@ -419,8 +413,7 @@ def profile(
             return summary, per_file_matrix
         return summary
     finally:
-        if persisted:
-            exploded.unpersist()
+        sdata.unpersist_df(exploded)
 
 
 def _suggest_action(row, max_categorical, promote_min_coverage, id_like_frac) -> str:
@@ -641,9 +634,7 @@ def profile_sample(
         _payload_as_json_expr(df, col).alias("v"),
     )
     exploded = payload.mapInPandas(_explode_partition, schema=_EXPLODE_SCHEMA)
-    persisted = getattr(sdata, "persist_intermediaries", False)
-    if persisted:
-        exploded = exploded.persist(sdata.persist_storage_level)
+    exploded = sdata.persist_df(exploded)
 
     columns = [
         "key", "n_samples_present", "n_samples_total",
@@ -698,8 +689,7 @@ def profile_sample(
                 print(f"  promote_sample: {promote_keys}")
         return result
     finally:
-        if persisted:
-            exploded.unpersist()
+        sdata.unpersist_df(exploded)
 
 
 def promote_sample(

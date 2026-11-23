@@ -92,8 +92,7 @@ def make_var_names_unique(sdata, remove_null_genes=True):
     # Add file_path back (lost in groupBy at line 77)
     new_var = new_var.join(F.broadcast(sdata.file_mapping), on='fp_int', how='left')
     
-    if sdata.persist_intermediaries:
-        new_var.persist(sdata.persist_storage_level)
+    new_var = sdata.persist_df(new_var)
 
     # Update and aggregate X
     sdata.X = (
@@ -240,13 +239,12 @@ def calculate_qc_metrics(sdata: SprayData, mt_prepend='MT-'):
         F.first('pct_mt').alias('pct_mt'),
     )
 
-    if sdata.persist_intermediaries:
-        count_df.persist(sdata.persist_storage_level)
-        cell_bincount_df.persist(sdata.persist_storage_level)
-        gene_bincount_df.persist(sdata.persist_storage_level)
-        cell_sdf.persist(sdata.persist_storage_level)
-        if sdata.materialize_off_route:
-            materialize(cell_sdf)
+    count_df = sdata.persist_df(count_df)
+    cell_bincount_df = sdata.persist_df(cell_bincount_df)
+    gene_bincount_df = sdata.persist_df(gene_bincount_df)
+    cell_sdf = sdata.persist_df(cell_sdf)
+    if sdata.persist_intermediaries and sdata.materialize_off_route:
+        materialize(cell_sdf)
 
 
     sample_metrics = count_df.groupby('fp_int').agg(
@@ -558,9 +556,8 @@ def calculate_hvg(
             & (sdf_stats.z_dispersion>min_z_dispersion)
         )
 
-    if sdata.persist_intermediaries:
-        sdf_stats.persist(sdata.persist_storage_level) # htis one may need materialize...
-        sdf_filtered.persist(sdata.persist_storage_level)
+    sdf_stats = sdata.persist_df(sdf_stats)
+    sdf_filtered = sdata.persist_df(sdf_filtered)
 
     # perform filtering on sta,X,var to only leave the rows relating to these selected HGV genes
     # Use gene_idx for fast integer joins

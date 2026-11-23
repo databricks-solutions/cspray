@@ -104,6 +104,7 @@ class SprayData:
         self.sta = sta
         self.uns = uns
         self._file_mapping = None  # Cache for lazy loading
+        self._persisted = []
         self.write_order = [
             'X','var','obs','clu','sta','sam'
         ]
@@ -142,13 +143,15 @@ class SprayData:
         Parameters
         ----------
         persist : bool, optional
-            If True, intermediary DataFrames during individual steps will be persisted in memory
-            or on disk to improve performance during repeated access or downstream processing.
-            Defaults to True. Note, if you rite your own functions for processing you'll use the 
-            if sdata.perist_intermediaries: concept to wrap a persist statement.
+            If True (default), pipeline steps keep intermediate DataFrames
+            in Spark's cache so later actions in the same step do not
+            recompute them. Set False to skip that. If you add your own
+            steps, pass intermediates through ``persist_df`` and use the
+            returned frame.
         storage_level : str, optional
-            Specifies the Spark storage level for persisting DataFrames. Common options include
-            'MEMORY_AND_DISK', 'MEMORY_ONLY', etc. Defaults to 'MEMORY_AND_DISK_DESER'.
+            Spark storage level for those intermediates. Defaults to
+            ``MEMORY_AND_DISK_DESER``. On Databricks serverless this
+            argument is ignored.
         materialize_off_route : bool, optional
             If True, materializes DataFrames outside the main computation DAG, typically after writing
             the expression matrix (X), to minimize recomputation and optimize resource usage.
@@ -157,6 +160,37 @@ class SprayData:
         self.persist_intermediaries = persist
         self.persist_storage_level = get_storage_level(storage_level)
         self.materialize_off_route = materialize_off_route
+
+    def persist_df(self, df):
+        """Persist ``df`` if intermediary persistence is on; otherwise return it unchanged.
+
+        Always use the returned DataFrame. On Databricks serverless, persist
+        runs immediately, and unpersisting a frame makes it (and DataFrames
+        built from it) unusable — only unpersist something you are done with.
+        """
+        if df is None or not self.persist_intermediaries:
+            return df
+        df = df.persist(self.persist_storage_level)
+        self._persisted.append(df)
+        return df
+
+    def unpersist_df(self, df):
+        """Unpersist a DataFrame previously passed through ``persist_df``."""
+        if df is None:
+            return
+        df.unpersist()
+        self._persisted = [x for x in self._persisted if x is not df]
+
+    def release_intermediaries(self):
+        """Unpersist every DataFrame recorded by ``persist_df``.
+
+        ``to_tables_and_reset`` calls this after the write, before reloading
+        from tables. Do not call it after ``to_tables`` if you still need
+        the in-memory frames.
+        """
+        for df in self._persisted:
+            df.unpersist()
+        self._persisted = []
 
     @property
     def file_mapping(self):
@@ -373,8 +407,6 @@ class SprayData:
             out_subset.append(k)
             print("time elapsed = ", time.time()-t0)
 
-        if self.persist_intermediaries:
-            spark.catalog.clearCache()
         return out_subset
         
     
@@ -466,6 +498,8 @@ class SprayData:
             cluster=cluster,
             replace_where=replace_where,
         )
+
+        self.release_intermediaries()
 
         # reset the ones that were saved
         for k in subset:

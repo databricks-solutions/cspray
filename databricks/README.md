@@ -33,8 +33,8 @@ sdata = SprayData.from_h5ads(
 )
 ```
 
-**Serverless compute** does not support Spark `persist`/`cache`, so intermediary
-persistence has to be turned off after constructing `sdata`:
+**Serverless:** turn intermediary persistence off (ingest already does).
+PCA and clustering should still be run on classic for now.
 
 ```
 sdata = SprayData.from_h5ads(
