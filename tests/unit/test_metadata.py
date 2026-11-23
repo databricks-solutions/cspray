@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+
 import pytest
 import pandas as pd
 import numpy as np
@@ -284,3 +286,94 @@ def test_metadata_promote_suggested(dummy_h5ad_pair, spark_collect):
     # --- guard: keys override not allowed with which='both' ----------------
     with pytest.raises(ValueError):
         cs.md.promote_suggested(sdata, which='both', keys=['cell_type'])
+
+
+def test_promote_applies_dry_run_plan(dummy_h5ad_pair, spark_collect):
+    """promote(sdata, plan=) is the apply step for a dry_run plan."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False, mode='delta',
+        obs_metadata_columns='all', var_metadata_columns='all',
+        metadata_variant=False, force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    plan = cs.md.promote_suggested(
+        sdata, which='both', promote_sam=True, dry_run=True, verbose=False,
+        profile_kwargs={'max_categorical': 3},
+    )
+    plan = plan[plan['key'].isin(['cell_type', 'tissue', 'highly_variable'])]
+    cs.md.promote(sdata, plan=plan)
+
+    assert 'cell_type' in sdata.obs.columns
+    assert 'tissue' not in sdata.obs.columns
+    assert 'tissue' in sdata.sam.columns
+    assert 'highly_variable' in sdata.var.columns
+    obs = sdata.obs.select('cell_barcode', 'cell_type').toPandas().set_index('cell_barcode')
+    assert obs.loc['cA0', 'cell_type'] == 'T'
+
+
+def test_promote_dest_from_suggested_and_plan(dummy_h5ad_pair, spark_collect, tmp_path):
+    """Dest rewrite writes obs/var/sam only; bronze and X stay put."""
+    spark = spark_collect
+    bronze = str(tmp_path / 'bronze')
+    dest_suggested = str(tmp_path / 'dest_suggested')
+    dest_plan = str(tmp_path / 'dest_plan')
+
+    sdata = SprayData.from_h5ads(
+        spark, path=dummy_h5ad_pair, from_raw=False, mode='delta',
+        obs_metadata_columns='all', var_metadata_columns='all',
+        metadata_variant=False, force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    plan = cs.md.promote_suggested(
+        sdata, which='both', promote_sam=True, dry_run=True, verbose=False,
+        profile_kwargs={'max_categorical': 3},
+    )
+    plan = plan[plan['key'].isin(['cell_type', 'tissue', 'highly_variable'])]
+    sdata.to_tables(spark, table_base=bronze, join_char='/')
+
+    cs.md.promote(
+        spark, bronze, dest_suggested, suggested=True, join_char='/',
+        mode='delta', profile_kwargs={'max_categorical': 3},
+    )
+    cs.md.promote(
+        spark, bronze, dest_plan, plan=plan, join_char='/', mode='delta',
+    )
+
+    bronze_loaded = SprayData.from_tables(
+        spark, bronze, join_char='/', mode='delta',
+    )
+    assert 'cell_type' not in bronze_loaded.obs.columns
+    assert bronze_loaded.X is not None
+
+    for dest in (dest_suggested, dest_plan):
+        loaded = SprayData.from_tables(spark, dest, join_char='/', mode='delta')
+        assert loaded.X is None
+        assert not (Path(dest) / 'X').exists()
+        assert 'cell_type' in loaded.obs.columns
+        assert 'tissue' not in loaded.obs.columns
+        assert 'tissue' in loaded.sam.columns
+        assert 'highly_variable' in loaded.var.columns
+        obs = loaded.obs.select('cell_barcode', 'cell_type').toPandas().set_index(
+            'cell_barcode'
+        )
+        assert obs.loc['cA0', 'cell_type'] == 'T'
+        sam = loaded.sam.select('file_path', 'tissue').toPandas().set_index('file_path')
+        assert sam.loc[dummy_h5ad_pair[0], 'tissue'] == 'lung'
+        assert sam.loc[dummy_h5ad_pair[1], 'tissue'] == 'blood'
+
+
+def test_promote_dest_guards(spark_collect, tmp_path):
+    bronze = str(tmp_path / 'bronze')
+    dest = str(tmp_path / 'dest')
+    with pytest.raises(ValueError, match='plan='):
+        cs.md.promote(spark_collect, bronze, dest, join_char='/', mode='delta')
+    with pytest.raises(ValueError, match='differ'):
+        cs.md.promote(
+            spark_collect, bronze, bronze, suggested=True,
+            join_char='/', mode='delta',
+        )
+    with pytest.raises(ValueError, match='not both'):
+        cs.md.promote(
+            spark_collect, bronze, dest, plan=pd.DataFrame(),
+            suggested=True, join_char='/', mode='delta',
+        )

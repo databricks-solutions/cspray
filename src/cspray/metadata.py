@@ -15,7 +15,10 @@ top-level columns for filtering.
 Public API (exposed as ``cs.md``):
 - ``profile(sdata, which='obs'|'var', per_file=..., ...)`` -> pandas report
 - ``profile_obs`` / ``profile_var`` -> thin convenience wrappers
-- ``promote(sdata, keys, which='obs'|'var', ...)`` -> materialize given keys as columns
+- ``promote(sdata, keys, which='obs'|'var', ...)`` -> materialize given keys
+- ``promote(sdata, plan=plan)`` -> apply a dry_run plan (obs/var/sample)
+- ``promote(spark, source, dest, plan=...|suggested=True)`` -> rewrite dest
+  ``obs`` / ``var`` / ``sam`` from bronze (never ``X``)
 - ``promote_suggested(sdata, which='obs'|'var'|'both', promote_sam=...)`` ->
   profile + promote the recommended keys (typed) in one call, optionally
   routing sample-constant keys to ``sam``
@@ -27,14 +30,20 @@ Public API (exposed as ``cs.md``):
   ``sam`` instead of repeating it on every cell
 - ``promote_sample_suggested(sdata, ...)`` -> profile_sample + promote_sample
 
-Promotion offers three paths depending on how much control you want:
+Promotion offers three in-memory paths depending on how much control you want:
 
 1. Automatic  -> ``promote_suggested(sdata, which='both')`` profiles and
    promotes the recommended keys with inferred types in one call.
 2. Review-then-apply -> ``promote_suggested(..., dry_run=True)`` returns the
-   plan (key -> dtype -> action) to edit, then you call ``promote`` with it.
+   plan (``which, key, dtype, suggested_action``) to edit, then
+   ``promote(sdata, plan=plan)``.
 3. Full manual -> use ``profile`` + ``promote`` directly with your own key list
    and ``dtypes``.
+
+The same plan feeds dest tables. ``promote(spark, bronze, dest, plan=plan)``
+(or ``suggested=True``) rebuilds dest ``obs`` / ``var`` / ``sam`` and leaves
+bronze, including ``X``, alone. Daily dest-schema updates for a set of
+``fp_ints`` are a separate path.
 
 The sample functions mirror those paths (``promote_sample_suggested`` supports
 ``dry_run``), or ride along with the obs/var pass via
@@ -51,12 +60,17 @@ import re
 from typing import List, Optional, Tuple, Union
 
 import pandas as pd
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import Window
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-from .data import SAM_REGISTRY_COLUMNS
+from .data import SAM_REGISTRY_COLUMNS, SprayData
+
+_PLAN_COLUMNS = ("which", "key", "dtype")
+_PLAN_WHICH = frozenset({"obs", "var", "sample"})
+_DEST_TABLES = ["obs", "var", "sam"]
+_AXIS_WHICH = frozenset({"obs", "var", "both"})
 
 # which -> (SprayData attribute, default payload column, row-key column)
 _AXES = {
@@ -893,7 +907,28 @@ def promote_sample_suggested(
     return sdata
 
 
-def promote(
+def _coerce_plan(plan):
+    """Validate a dry_run plan DataFrame (``which, key, dtype``)."""
+    if not isinstance(plan, pd.DataFrame):
+        raise TypeError(
+            "plan= must be a pandas DataFrame from "
+            "promote_suggested(..., dry_run=True)"
+        )
+    missing = [c for c in _PLAN_COLUMNS if c not in plan.columns]
+    if missing:
+        raise ValueError(
+            f"plan is missing columns {missing}; expected which, key, dtype"
+        )
+    unknown = set(plan["which"].dropna().unique()) - _PLAN_WHICH
+    if unknown:
+        raise ValueError(
+            "plan which values must be obs, var, or sample; "
+            f"got {sorted(unknown)}"
+        )
+    return plan
+
+
+def _promote_columns(
     sdata,
     keys: Union[str, List[str]],
     which: str = "obs",
@@ -902,40 +937,7 @@ def promote(
     dtypes: Optional[Union[str, dict]] = None,
     inplace: bool = True,
 ):
-    """Materialize selected metadata keys into typed top-level columns.
-
-    Extracts the given keys from the semi-structured payload into their own
-    columns on obs/var so they can be used for filtering/joins. This is the
-    low-level, full-control primitive: you supply the exact keys and (optionally)
-    their types. For the common "promote everything worth filtering on, typed"
-    workflow, see :func:`promote_suggested`, which profiles and calls this for
-    you (and supports a ``dry_run`` review step).
-
-    Parameters
-    ----------
-    sdata : SprayData
-    keys : str or list of str
-        Top-level key(s) to promote.
-    which : str
-        'obs' or 'var'.
-    column : str, optional
-        Override payload column name (defaults to obs_data / var_data).
-    prefix : str
-        Prefix for the new column names (default '' -> sanitised key). Dots and
-        other non-alphanumeric characters in the key become ``_``.
-    dtypes : str or dict, optional
-        Target Spark type for extracted columns. A single string applies to all
-        keys; a dict maps key -> type. Defaults to string. For VARIANT payloads
-        the type is applied via ``variant_get``; for JSON strings the extracted
-        string is cast.
-    inplace : bool
-        If True (default) update ``sdata.<which>`` in place and return sdata;
-        otherwise return the new DataFrame.
-
-    Returns
-    -------
-    SprayData or pyspark.sql.DataFrame
-    """
+    """Materialize selected payload keys as columns on obs or var."""
     if isinstance(keys, str):
         keys = [keys]
     df, default_col, _ = _resolve_axis(sdata, which)
@@ -966,6 +968,197 @@ def promote(
         setattr(sdata, which, out)
         return sdata
     return out
+
+
+def _apply_promotion_plan(sdata, plan, prefix: str = ""):
+    """Apply a dry_run plan: sample keys to sam, others to obs/var."""
+    plan = _coerce_plan(plan)
+    sam_rows = plan[plan["which"] == "sample"]
+    if not sam_rows.empty:
+        promote_sample(
+            sdata,
+            sam_rows["key"].tolist(),
+            prefix=prefix,
+            dtypes=dict(zip(sam_rows["key"], sam_rows["dtype"])),
+        )
+    for ax in ("obs", "var"):
+        ax_plan = plan[plan["which"] == ax]
+        keys = ax_plan["key"].tolist()
+        if keys:
+            _promote_columns(
+                sdata,
+                keys,
+                which=ax,
+                prefix=prefix,
+                dtypes=dict(zip(ax_plan["key"], ax_plan["dtype"])),
+            )
+    return sdata
+
+
+def _promote_dest(
+    spark,
+    source,
+    dest,
+    *,
+    plan=None,
+    suggested=False,
+    join_char=".",
+    mode=None,
+    profile_kwargs=None,
+    prefix="",
+):
+    """Rebuild dest obs/var/sam from bronze using a plan or suggestions."""
+    if source is None or dest is None:
+        raise TypeError(
+            "table promotion is promote(spark, source, dest, plan=...) "
+            "or promote(spark, source, dest, suggested=True)"
+        )
+    if not isinstance(source, str) or not isinstance(dest, str):
+        raise TypeError("source and dest must be table-prefix strings")
+    if dest in _AXIS_WHICH:
+        raise TypeError(
+            "promote(spark, source, dest, ...) needs a dest table prefix "
+            "(third argument is dest, not which=)"
+        )
+    if source == dest:
+        raise ValueError("dest must differ from source so bronze stays unchanged")
+    if suggested and plan is not None:
+        raise ValueError("pass plan= or suggested=True, not both")
+    if not suggested and plan is None:
+        raise ValueError("rewriting dest requires plan= or suggested=True")
+
+    sdata = SprayData.from_tables(spark, source, join_char=join_char, mode=mode)
+    sdata.set_intermediary_persistance(False)
+    if sdata.obs is None and sdata.var is None:
+        raise ValueError(f"no obs/var tables found at {source!r}")
+    if suggested:
+        promote_suggested(
+            sdata,
+            which="both",
+            promote_sam=True,
+            verbose=False,
+            profile_kwargs=profile_kwargs,
+            prefix=prefix,
+        )
+    else:
+        _apply_promotion_plan(sdata, plan, prefix=prefix)
+    sdata.to_tables(
+        spark, table_base=dest, join_char=join_char, subset=_DEST_TABLES,
+    )
+    return sdata
+
+
+def promote(
+    sdata,
+    keys: Optional[Union[str, List[str]]] = None,
+    which: str = "obs",
+    column: Optional[str] = None,
+    prefix: str = "",
+    dtypes: Optional[Union[str, dict]] = None,
+    inplace: bool = True,
+    *,
+    source: Optional[str] = None,
+    dest: Optional[str] = None,
+    plan: Optional[pd.DataFrame] = None,
+    suggested: bool = False,
+    join_char: str = ".",
+    mode: Optional[str] = None,
+    profile_kwargs: Optional[dict] = None,
+):
+    """Materialize metadata, in memory or as dest obs/var/sam tables.
+
+    In memory this is the low-level primitive (``keys`` on one axis) and the
+    apply step for a dry_run plan (``plan=``). For dest tables, the first
+    argument is a Spark session: bronze stays skinny, dest ``obs`` / ``var`` /
+    ``sam`` are overwritten, and ``X`` is never written.
+
+        plan = cs.md.promote_suggested(sdata, which='both', promote_sam=True,
+                                       dry_run=True)
+        cs.md.promote(sdata, plan=plan)
+        cs.md.promote(spark, bronze, dest, plan=plan)
+        cs.md.promote(spark, bronze, dest, suggested=True)
+
+    Parameters
+    ----------
+    sdata : SprayData or SparkSession
+        SprayData for the in-memory form; a Spark session for dest rewrite.
+    keys : str or list of str, optional
+        Top-level key(s) to promote in memory. For dest rewrite this positional
+        is the source (bronze) prefix unless ``source=`` is given.
+    which : str
+        In memory: ``'obs'`` or ``'var'``. For dest rewrite the third positional
+        is the dest prefix (keyword ``dest=`` is equivalent).
+    column : str, optional
+        Override payload column name (defaults to obs_data / var_data).
+    prefix : str
+        Prefix for the new column names (default '' -> sanitised key). Dots and
+        other non-alphanumeric characters in the key become ``_``.
+    dtypes : str or dict, optional
+        Target Spark type for extracted columns. A single string applies to all
+        keys; a dict maps key -> type. Defaults to string. For VARIANT payloads
+        the type is applied via ``variant_get``; for JSON strings the extracted
+        string is cast.
+    inplace : bool
+        If True (default) update ``sdata.<which>`` in place and return sdata;
+        otherwise return the new DataFrame. Dest rewrite always writes tables
+        and returns the in-memory SprayData.
+    source, dest : str, optional
+        Table prefixes for dest rewrite. ``promote(spark, source, dest, ...)``
+        binds these positionally as ``keys`` and ``which``.
+    plan : pandas.DataFrame, optional
+        Output of ``promote_suggested(..., dry_run=True)`` (columns
+        ``which, key, dtype``). Applies obs/var/sample rows.
+    suggested : bool
+        Dest rewrite only: profile bronze and promote the recommended keys
+        (obs/var plus sample-constant keys onto ``sam``).
+    join_char : str
+        Join character for dest table names. Defaults to ``'.'``.
+    mode : str, optional
+        ``SprayData`` mode for dest table I/O (``'databricks'`` or ``'delta'``).
+    profile_kwargs : dict, optional
+        Forwarded to :func:`promote_suggested` when ``suggested=True``.
+
+    Returns
+    -------
+    SprayData or pyspark.sql.DataFrame
+    """
+    if isinstance(sdata, SparkSession):
+        table_source = source if source is not None else keys
+        table_dest = dest
+        if table_dest is None and which not in _AXIS_WHICH:
+            table_dest = which
+        return _promote_dest(
+            sdata,
+            table_source,
+            table_dest,
+            plan=plan,
+            suggested=suggested,
+            join_char=join_char,
+            mode=mode,
+            profile_kwargs=profile_kwargs,
+            prefix=prefix,
+        )
+    if suggested:
+        raise ValueError(
+            "suggested=True rebuilds dest tables; in memory use promote_suggested"
+        )
+    if source is not None or dest is not None:
+        raise TypeError("source= and dest= are for promote(spark, source, dest, ...)")
+    if plan is not None:
+        if keys is not None:
+            raise ValueError("pass keys= or plan=, not both")
+        return _apply_promotion_plan(sdata, plan, prefix=prefix)
+    if keys is None:
+        raise TypeError("promote() requires keys or plan=")
+    return _promote_columns(
+        sdata,
+        keys,
+        which=which,
+        column=column,
+        prefix=prefix,
+        dtypes=dtypes,
+        inplace=inplace,
+    )
 
 
 def _plan_for_axis(sdata, which, actions, keys, infer_types, dtypes, type_map, profile_kwargs):
@@ -1034,8 +1227,7 @@ def promote_suggested(
 
         plan = cs.md.promote_suggested(sdata, which='obs', dry_run=True)
         plan = plan[plan.key != 'unwanted_key']
-        cs.md.promote(sdata, plan.key.tolist(),
-                      dtypes=dict(zip(plan.key, plan.dtype)), which='obs')
+        cs.md.promote(sdata, plan=plan)
 
     3. Full manual control: skip this function and use :func:`profile` +
        :func:`promote` directly, supplying your own key list and ``dtypes``.
@@ -1141,24 +1333,4 @@ def promote_suggested(
     if dry_run:
         return plan
 
-    sam_rows = plan[plan["which"] == "sample"]
-    if not sam_rows.empty:
-        promote_sample(
-            sdata,
-            sam_rows["key"].tolist(),
-            prefix=prefix,
-            dtypes=dict(zip(sam_rows["key"], sam_rows["dtype"])),
-        )
-
-    for ax in axes:
-        ax_plan = plan[plan["which"] == ax]
-        ks = ax_plan["key"].tolist()
-        if ks:
-            promote(
-                sdata,
-                ks,
-                which=ax,
-                prefix=prefix,
-                dtypes=dict(zip(ax_plan["key"], ax_plan["dtype"])),
-            )
-    return sdata
+    return _apply_promotion_plan(sdata, plan, prefix=prefix)
