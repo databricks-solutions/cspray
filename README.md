@@ -50,7 +50,8 @@ Additionally for Databricks users there are some example notebooks and we expect
 
 CSpray is a python package for end-to-end processing of single cell data using pyspark for efficient distributed compute. This allows for scaling of single cell RNA analysis over the scale of many samples, including multiple atlas scale h5ad files, and with increasing sample sizes as technology continues to improve. The package has several key modules that represent key analysis stages:
  
- - ingest : keep Delta tables up to date from a directory of h5ads (`cspray.ingest.run`)
+  - ingest : keep Delta tables up to date from a directory of h5ads (`cspray.ingest.run`)
+ - metadata : profile payloads and promote typed dest columns (`cs.md`)
  - read : one-off load of h5ad to dataframes (`from_h5ads`)
  - preprocessing : gene/cell filtering, highly variable gene annotation
  - tools : PCA, clustering, marker gene extraction
@@ -69,7 +70,6 @@ These next two sections are different jobs:
 
 - **Already processed h5ads on disk**, and you want Delta tables that stay in
   sync as that directory grows or files get replaced → `cspray.ingest.run`
-  (no QC / HVG / PCA).
 - **You want cspray to filter, HVG, PCA, and cluster** → the pipeline example.
   That path starts from `from_h5ads` and **overwrites** bronze/silver/gold each
   run. It is not the daily “add last night’s files” job.
@@ -77,26 +77,48 @@ These next two sections are different jobs:
 ## Updating tables from h5ads on disk
 
 Use this when the h5ads are already processed (your own pipeline, a published
-atlas, a collaborator’s files). `ingest.run` only maintains the tables: new
-files are added, files that changed on disk are rewritten, unchanged files are
-left alone.
+atlas, a collaborator’s files). Run the same two calls every day: ingest the
+files, then turn useful metadata into columns you can filter on.
 
-Leave `create_if_not_exists=True` on the job. Day 1 (no tables) is a full
-write; every later run with the same call is incremental. Without that flag,
-a missing `sam` table is an error so you cannot start a full ingest by
-accident.
+`ingest.run` keeps the tables in sync with the directory: new files are added,
+files that changed on disk are rewritten, unchanged files are left alone.
+`md.run` then allows you to extract metadata columns that are consistent over 
+files into structured columns on new tables for obs, var and sam. 
+
 
 ```
 import cspray as cs
 
-cs.ingest.run(
+base = 'singlecell'              # on Databricks: f'{CATALOG}.{SCHEMA}'
+
+stats = cs.ingest.run(
     spark,
     path='/data/h5ads',          # directory, one file, or a list of paths
-    table_base='singlecell.bronze',
+    table_base=base,
+    join_char='.bronze_',        # tables: singlecell.bronze_X, _obs, …
     from_raw=False,              # files are already processed
+    obs_metadata_columns='all',
+    var_metadata_columns='all',
     create_if_not_exists=True,   # first load if empty; ignored once tables exist
 )
+
+cs.md.run(
+    spark,
+    source=base,                 # read the ingest tables
+    dest=base,                   # write metadata tables in the same place
+    join_char='.bronze_',        # …bronze_X, bronze_obs, …
+    dest_join_char='.md_',       # …md_obs, md_var, md_sam
+    create_if_not_exists=True,
+    suggested=True,              # pick columns the first time; reused after
+    fp_ints=stats.get('fp_ints'),
+)
 ```
+
+The first `md.run` with `suggested=True` chooses the columns (or pass
+`plan=` if you want to choose them yourself). After that, new files get the
+same columns. If ingest did not write anything, `md.run` does nothing. To
+pick different columns, drop the metadata tables (`singlecell.md_obs` and
+the matching `_var` / `_sam`) and run again — you do not need to re-ingest.
 
 Do not follow this with `from_h5ads` + overwrite — that would rebuild every
 table from scratch, which is the other example.
@@ -154,7 +176,11 @@ h5ad files disagree on which obs/var columns exist, so the flexible non-key
 columns are captured at read time into a single semi-structured column
 (`obs_data` on obs, `var_data` on var) as VARIANT or a JSON string. Reading only
 captures; you then decide what to materialize as typed columns, and where those
-columns belong:
+columns belong.
+
+If you are updating tables from a directory of files, use `cs.md.run` in the
+ingest section above. The snippet below is for a SprayData you already have
+in memory:
 
 ```
 sdata = SprayData.from_h5ads(

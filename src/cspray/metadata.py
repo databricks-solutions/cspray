@@ -15,7 +15,10 @@ top-level columns for filtering.
 Public API (exposed as ``cs.md``):
 - ``profile(sdata, which='obs'|'var', per_file=..., ...)`` -> pandas report
 - ``profile_obs`` / ``profile_var`` -> thin convenience wrappers
-- ``promote(sdata, keys, which='obs'|'var', ...)`` -> materialize given keys as columns
+- ``promote(sdata, keys, which='obs'|'var', ...)`` -> materialize given keys
+- ``promote(sdata, plan=plan)`` -> apply a dry_run plan (obs/var/sample)
+- ``run(spark, source, dest, ...)`` -> ingest-style dest ``obs`` / ``var`` /
+  ``sam`` (never ``X``): same call every day
 - ``promote_suggested(sdata, which='obs'|'var'|'both', promote_sam=...)`` ->
   profile + promote the recommended keys (typed) in one call, optionally
   routing sample-constant keys to ``sam``
@@ -27,14 +30,33 @@ Public API (exposed as ``cs.md``):
   ``sam`` instead of repeating it on every cell
 - ``promote_sample_suggested(sdata, ...)`` -> profile_sample + promote_sample
 
-Promotion offers three paths depending on how much control you want:
+Promotion offers three in-memory paths depending on how much control you want:
 
 1. Automatic  -> ``promote_suggested(sdata, which='both')`` profiles and
    promotes the recommended keys with inferred types in one call.
 2. Review-then-apply -> ``promote_suggested(..., dry_run=True)`` returns the
-   plan (key -> dtype -> action) to edit, then you call ``promote`` with it.
+   plan (``which, key, dtype, suggested_action``) to edit, then
+   ``promote(sdata, plan=plan)``.
 3. Full manual -> use ``profile`` + ``promote`` directly with your own key list
    and ``dtypes``.
+
+``run`` is the lake job, parallel to ``ingest.run``. Tables are named
+``table_base + join_char + slot``, same as ingest. ``join_char`` is how
+source (ingest) tables were named; ``dest_join_char`` is how dest
+``obs`` / ``var`` / ``sam`` are named (defaults to ``join_char``). Source
+and dest prefixes may be the same string when the joiners differ.
+Dest missing and ``create_if_not_exists=True`` builds dest from
+``suggested=True`` or ``plan=``. Dest already there: those flags are
+ignored and dest's current columns are filled for ``fp_ints`` (or a
+no-op if ingest wrote nothing). Drop dest ``obs`` / ``var`` / ``sam``
+for a full metadata refresh; bronze, including ``X``, stays. You do
+not reingest.
+
+Dest column names are whatever ``_safe_column_name`` / ``_unique_column_name``
+produced when dest was written (``orig.ident`` becomes ``orig_ident``, and so
+on). Daily updates fill those columns; they do not rename them. If you upgrade
+to a version where those helpers changed, drop dest metadata tables and let
+the next ``run`` recreate them.
 
 The sample functions mirror those paths (``promote_sample_suggested`` supports
 ``dry_run``), or ride along with the obs/var pass via
@@ -56,7 +78,16 @@ from pyspark.sql import Window
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-from .data import SAM_REGISTRY_COLUMNS
+from .data import SAM_REGISTRY_COLUMNS, SprayData
+from .ingest import _table_exists, _table_name
+from .write import fp_int_predicate
+
+_PLAN_COLUMNS = ("which", "key", "dtype")
+_PLAN_WHICH = frozenset({"obs", "var", "sample"})
+_DEST_TABLES = ["obs", "var", "sam"]
+_OBS_SKINNY = frozenset({"fp_int", "cell_idx", "cell_barcode", "file_path", "obs_data"})
+_VAR_SKINNY = frozenset({"fp_int", "gene_idx", "gene_id", "gene_name", "file_path", "var_data"})
+_SAM_SKINNY = frozenset(SAM_REGISTRY_COLUMNS)
 
 # which -> (SprayData attribute, default payload column, row-key column)
 _AXES = {
@@ -893,7 +924,28 @@ def promote_sample_suggested(
     return sdata
 
 
-def promote(
+def _coerce_plan(plan):
+    """Validate a dry_run plan DataFrame (``which, key, dtype``)."""
+    if not isinstance(plan, pd.DataFrame):
+        raise TypeError(
+            "plan= must be a pandas DataFrame from "
+            "promote_suggested(..., dry_run=True)"
+        )
+    missing = [c for c in _PLAN_COLUMNS if c not in plan.columns]
+    if missing:
+        raise ValueError(
+            f"plan is missing columns {missing}; expected which, key, dtype"
+        )
+    unknown = set(plan["which"].dropna().unique()) - _PLAN_WHICH
+    if unknown:
+        raise ValueError(
+            "plan which values must be obs, var, or sample; "
+            f"got {sorted(unknown)}"
+        )
+    return plan
+
+
+def _promote_columns(
     sdata,
     keys: Union[str, List[str]],
     which: str = "obs",
@@ -902,40 +954,7 @@ def promote(
     dtypes: Optional[Union[str, dict]] = None,
     inplace: bool = True,
 ):
-    """Materialize selected metadata keys into typed top-level columns.
-
-    Extracts the given keys from the semi-structured payload into their own
-    columns on obs/var so they can be used for filtering/joins. This is the
-    low-level, full-control primitive: you supply the exact keys and (optionally)
-    their types. For the common "promote everything worth filtering on, typed"
-    workflow, see :func:`promote_suggested`, which profiles and calls this for
-    you (and supports a ``dry_run`` review step).
-
-    Parameters
-    ----------
-    sdata : SprayData
-    keys : str or list of str
-        Top-level key(s) to promote.
-    which : str
-        'obs' or 'var'.
-    column : str, optional
-        Override payload column name (defaults to obs_data / var_data).
-    prefix : str
-        Prefix for the new column names (default '' -> sanitised key). Dots and
-        other non-alphanumeric characters in the key become ``_``.
-    dtypes : str or dict, optional
-        Target Spark type for extracted columns. A single string applies to all
-        keys; a dict maps key -> type. Defaults to string. For VARIANT payloads
-        the type is applied via ``variant_get``; for JSON strings the extracted
-        string is cast.
-    inplace : bool
-        If True (default) update ``sdata.<which>`` in place and return sdata;
-        otherwise return the new DataFrame.
-
-    Returns
-    -------
-    SprayData or pyspark.sql.DataFrame
-    """
+    """Materialize selected payload keys as columns on obs or var."""
     if isinstance(keys, str):
         keys = [keys]
     df, default_col, _ = _resolve_axis(sdata, which)
@@ -966,6 +985,238 @@ def promote(
         setattr(sdata, which, out)
         return sdata
     return out
+
+
+def _apply_promotion_plan(sdata, plan, prefix: str = ""):
+    """Apply a dry_run plan: sample keys to sam, others to obs/var."""
+    plan = _coerce_plan(plan)
+    sam_rows = plan[plan["which"] == "sample"]
+    if not sam_rows.empty:
+        promote_sample(
+            sdata,
+            sam_rows["key"].tolist(),
+            prefix=prefix,
+            dtypes=dict(zip(sam_rows["key"], sam_rows["dtype"])),
+        )
+    for ax in ("obs", "var"):
+        ax_plan = plan[plan["which"] == ax]
+        keys = ax_plan["key"].tolist()
+        if keys:
+            _promote_columns(
+                sdata,
+                keys,
+                which=ax,
+                prefix=prefix,
+                dtypes=dict(zip(ax_plan["key"], ax_plan["dtype"])),
+            )
+    return sdata
+
+
+def _fp_ints_or_none(fp_ints):
+    """None or [] → no-op. A single id or list → ids. ``bool`` is rejected."""
+    if fp_ints is None:
+        return None
+    if isinstance(fp_ints, bool):
+        raise ValueError("fp_ints= must be ids, not bool")
+    if isinstance(fp_ints, int):
+        return [int(fp_ints)]
+    try:
+        ids = [int(x) for x in fp_ints]
+    except (TypeError, ValueError) as e:
+        raise ValueError("fp_ints= must be an id or a list of ids") from e
+    return ids or None
+
+
+def _payload_keys(sdata, which):
+    """Payload key names on this axis (``obs`` / ``var`` / ``sample``)."""
+    if which == "sample":
+        report = profile_sample(sdata, verbose=False)
+    else:
+        report = profile(sdata, which=which, verbose=False)
+        if isinstance(report, tuple):
+            report = report[0]
+    if report is None or report.empty:
+        return []
+    return report["key"].tolist()
+
+
+def _dest_plan_from_schema(sdata, dest, prefix=""):
+    """Match dest extra columns to payload keys via ``_safe_column_name``."""
+    rows = []
+    for which, dest_df, identity in (
+        ("obs", dest.obs, _OBS_SKINNY),
+        ("var", dest.var, _VAR_SKINNY),
+        ("sample", dest.sam, _SAM_SKINNY),
+    ):
+        dest_cols = [c for c in dest_df.columns if c not in identity]
+        if not dest_cols:
+            continue
+        by_col = {}
+        for key in _payload_keys(sdata, which):
+            col = _safe_column_name(f"{prefix}{key}")
+            by_col.setdefault(col, []).append(key)
+        for col in dest_cols:
+            matches = by_col.get(col, [])
+            if len(matches) > 1:
+                raise ValueError(
+                    f"dest column {col!r} matches multiple payload keys {matches}"
+                )
+            if not matches:
+                continue
+            rows.append({
+                "which": which,
+                "key": matches[0],
+                # extract as string; dest types are applied in _align_frame_to_dest
+                "dtype": None,
+                "suggested_action": "dest",
+            })
+    return pd.DataFrame(rows, columns=["which", "key", "dtype", "suggested_action"])
+
+
+def _align_frame_to_dest(df, dest_df):
+    """Project ``df`` onto dest columns and types; extra dest cols are null.
+
+    Values that cannot cast to the dest type (a later file's string in an
+    int column from the first load) become null rather than failing the write.
+    """
+    for field in dest_df.schema.fields:
+        if field.name not in df.columns:
+            df = df.withColumn(field.name, F.lit(None).cast(field.dataType))
+        else:
+            df = df.withColumn(
+                field.name,
+                F.expr(
+                    f"try_cast(`{field.name}` AS {field.dataType.simpleString()})"
+                ),
+            )
+    extra = [c for c in df.columns if c not in dest_df.columns]
+    if extra:
+        df = df.drop(*extra)
+    return df.select(*dest_df.columns)
+
+
+def _filter_to_fp_ints(sdata, ids):
+    pred = F.col("fp_int").isin(ids)
+    for name in _DEST_TABLES:
+        df = getattr(sdata, name, None)
+        if isinstance(df, DataFrame):
+            setattr(sdata, name, df.filter(pred))
+    return sdata
+
+
+def _load_source(spark, source, join_char, mode):
+    sdata = SprayData.from_tables(spark, source, join_char=join_char, mode=mode)
+    sdata.set_intermediary_persistance(False)
+    if sdata.obs is None and sdata.var is None:
+        raise ValueError(f"no obs/var tables found at {source!r}")
+    if sdata.sam is None:
+        raise ValueError(f"no sam table found at {source!r}")
+    return sdata
+
+
+def _assert_dest_distinct(source, dest, join_char, dest_join_char):
+    """Reject dest names that would overwrite ingest obs/var/sam."""
+    overlap = [
+        name for name in _DEST_TABLES
+        if _table_name(source, join_char, name)
+        == _table_name(dest, dest_join_char, name)
+    ]
+    if overlap:
+        names = ", ".join(
+            _table_name(source, join_char, name) for name in overlap
+        )
+        raise ValueError(
+            f"dest tables would overwrite source ({names}). "
+            "Pass dest_join_char= so metadata tables are not the ingest tables."
+        )
+
+
+def _resolve_dest(spark, dest, join_char, mode, create_if_not_exists):
+    """Whether dest obs/var/sam already exist (ingest-style first vs later)."""
+    present = [
+        name for name in _DEST_TABLES
+        if _table_exists(spark, _table_name(dest, join_char, name), mode)
+    ]
+    if len(present) == len(_DEST_TABLES):
+        return False
+    if present:
+        raise ValueError(
+            f"dest is incomplete ({', '.join(present)} exist, others missing). "
+            "Drop dest obs/var/sam for a first load, or restore the missing tables."
+        )
+    if create_if_not_exists:
+        return True
+    raise ValueError(
+        f"dest tables do not exist at {dest!r}. For a first load pass "
+        "create_if_not_exists=True. Check source/dest if you expected tables already."
+    )
+
+
+def promote(
+    sdata,
+    keys: Optional[Union[str, List[str]]] = None,
+    which: str = "obs",
+    column: Optional[str] = None,
+    prefix: str = "",
+    dtypes: Optional[Union[str, dict]] = None,
+    inplace: bool = True,
+    *,
+    plan: Optional[pd.DataFrame] = None,
+):
+    """Materialize selected metadata keys into typed top-level columns.
+
+    Extracts the given keys from the semi-structured payload into their own
+    columns on obs/var so they can be used for filtering/joins. This is the
+    in-memory primitive: you supply the exact keys and (optionally) their types,
+    or a dry_run ``plan``. For dest tables after ingest, see :func:`run`.
+
+        plan = cs.md.promote_suggested(sdata, which='both', promote_sam=True,
+                                       dry_run=True)
+        cs.md.promote(sdata, plan=plan)
+
+    Parameters
+    ----------
+    sdata : SprayData
+    keys : str or list of str, optional
+        Top-level key(s) to promote. Ignored when ``plan=`` is set.
+    which : str
+        'obs' or 'var'. Ignored when ``plan=`` is set (the plan has ``which``).
+    column : str, optional
+        Override payload column name (defaults to obs_data / var_data).
+    prefix : str
+        Prefix for the new column names (default '' -> sanitised key). Dots and
+        other non-alphanumeric characters in the key become ``_``.
+    dtypes : str or dict, optional
+        Target Spark type for extracted columns. A single string applies to all
+        keys; a dict maps key -> type. Defaults to string. For VARIANT payloads
+        the type is applied via ``variant_get``; for JSON strings the extracted
+        string is cast.
+    inplace : bool
+        If True (default) update ``sdata.<which>`` in place and return sdata;
+        otherwise return the new DataFrame. ``plan=`` always updates sdata.
+    plan : pandas.DataFrame, optional
+        Output of ``promote_suggested(..., dry_run=True)`` (columns
+        ``which, key, dtype``). Applies obs/var/sample rows.
+
+    Returns
+    -------
+    SprayData or pyspark.sql.DataFrame
+    """
+    if plan is not None:
+        if keys is not None:
+            raise ValueError("pass keys= or plan=, not both")
+        return _apply_promotion_plan(sdata, plan, prefix=prefix)
+    if keys is None:
+        raise TypeError("promote() requires keys or plan=")
+    return _promote_columns(
+        sdata,
+        keys,
+        which=which,
+        column=column,
+        prefix=prefix,
+        dtypes=dtypes,
+        inplace=inplace,
+    )
 
 
 def _plan_for_axis(sdata, which, actions, keys, infer_types, dtypes, type_map, profile_kwargs):
@@ -1034,8 +1285,7 @@ def promote_suggested(
 
         plan = cs.md.promote_suggested(sdata, which='obs', dry_run=True)
         plan = plan[plan.key != 'unwanted_key']
-        cs.md.promote(sdata, plan.key.tolist(),
-                      dtypes=dict(zip(plan.key, plan.dtype)), which='obs')
+        cs.md.promote(sdata, plan=plan)
 
     3. Full manual control: skip this function and use :func:`profile` +
        :func:`promote` directly, supplying your own key list and ``dtypes``.
@@ -1141,24 +1391,158 @@ def promote_suggested(
     if dry_run:
         return plan
 
-    sam_rows = plan[plan["which"] == "sample"]
-    if not sam_rows.empty:
-        promote_sample(
-            sdata,
-            sam_rows["key"].tolist(),
-            prefix=prefix,
-            dtypes=dict(zip(sam_rows["key"], sam_rows["dtype"])),
+    return _apply_promotion_plan(sdata, plan, prefix=prefix)
+
+
+def run(
+    spark,
+    source: str,
+    dest: str,
+    *,
+    plan: Optional[pd.DataFrame] = None,
+    suggested: bool = False,
+    fp_ints: Optional[Union[int, List[int]]] = None,
+    create_if_not_exists: bool = False,
+    join_char: str = ".",
+    dest_join_char: Optional[str] = None,
+    mode: Optional[str] = None,
+    profile_kwargs: Optional[dict] = None,
+    prefix: str = "",
+):
+    """Promote bronze payloads onto dest ``obs`` / ``var`` / ``sam``.
+
+    Same call every day, like :func:`cspray.ingest.run`. Bronze, including
+    ``X``, is never rewritten. Table names are ``table_base + join_char +
+    slot``, same as ingest. ``join_char`` finds the source tables;
+    ``dest_join_char`` names dest (default: ``join_char``). Prefixes may
+    be the same when the joiners differ.
+
+        base = f'{catalog}.{schema}'
+        stats = cs.ingest.run(spark, path, table_base=base,
+                              join_char='.bronze_', create_if_not_exists=True, ...)
+        cs.md.run(spark, base, base, join_char='.bronze_', dest_join_char='.md_',
+                  create_if_not_exists=True, suggested=True,
+                  fp_ints=stats.get('fp_ints'))
+
+    * Dest missing and ``create_if_not_exists=True``: first load. Uses
+      ``suggested=True`` or ``plan=`` (leave ``suggested=True`` on the job;
+      it is ignored once dest exists). Writes every bronze file.
+    * Dest already there: dest's current columns, ``replaceWhere`` for
+      ``fp_ints``. No ``fp_ints`` (ingest wrote nothing) is a no-op.
+      ``suggested`` / ``plan`` are ignored.
+    * Full metadata refresh: drop dest ``obs`` / ``var`` / ``sam`` and call
+      again with ``create_if_not_exists=True``. You do not reingest.
+
+    Daily updates match dest columns to payload keys with
+    ``_safe_column_name`` (``orig.ident`` → ``orig_ident``). If you upgrade
+    to a version where ``_safe_column_name`` or ``_unique_column_name``
+    changed how keys become dest columns, drop dest metadata tables and let
+    the next run recreate them — bronze stays put.
+
+    Parameters
+    ----------
+    spark : SparkSession
+    source, dest : str
+        Table prefixes (``table_base`` in ingest / ``to_tables``). May be
+        the same string when ``dest_join_char`` differs from ``join_char``.
+    plan : pandas.DataFrame, optional
+        First-load schema (``which, key, dtype``). Ignored when dest exists.
+        Do not pass with ``suggested=True`` on a first load.
+    suggested : bool
+        First-load recipe: profile bronze and promote recommended keys
+        (obs/var plus sample-constant keys onto ``sam``). Ignored when dest
+        exists. Default False so an interactive call cannot create dest
+        by accident; leave True on a scheduled job with
+        ``create_if_not_exists=True``.
+    fp_ints : int or list of int, optional
+        Files to update when dest exists. Ignored on first load (all bronze
+        files are written). None or [] is a no-op if dest already exists.
+    create_if_not_exists : bool
+        If True and dest obs/var/sam are missing, this run is the first load.
+        If dest already exists, the flag is ignored. Default False: missing
+        dest is an error.
+    join_char : str
+        Joiner for **source** table names (same as ingest). Defaults to ``'.'``.
+    dest_join_char : str, optional
+        Joiner for dest ``obs`` / ``var`` / ``sam``. Defaults to ``join_char``.
+        Pass this when source and dest share a prefix (one schema, two stages).
+    mode : str, optional
+        ``databricks`` or ``delta``. Default databricks.
+    profile_kwargs : dict, optional
+        Forwarded to :func:`promote_suggested` on first load with
+        ``suggested=True``.
+    prefix : str
+        Prefix used when dest was (or will be) built. Daily matching uses
+        the same prefix. Column names, not table names.
+
+    Returns
+    -------
+    dict
+        ``wrote``, ``fp_ints``, ``first_write``.
+    """
+    if mode is None:
+        mode = "databricks"
+    if not isinstance(source, str) or not isinstance(dest, str):
+        raise TypeError("source and dest must be table-prefix strings")
+    if dest_join_char is None:
+        dest_join_char = join_char
+    _assert_dest_distinct(source, dest, join_char, dest_join_char)
+
+    first_write = _resolve_dest(spark, dest, dest_join_char, mode, create_if_not_exists)
+    if first_write and suggested and plan is not None:
+        raise ValueError("pass plan= or suggested=True, not both")
+    if first_write and not suggested and plan is None:
+        raise ValueError(
+            "first dest load needs suggested=True or plan= "
+            "(create_if_not_exists=True only creates tables)"
         )
 
-    for ax in axes:
-        ax_plan = plan[plan["which"] == ax]
-        ks = ax_plan["key"].tolist()
-        if ks:
-            promote(
+    if not first_write:
+        ids = _fp_ints_or_none(fp_ints)
+        if ids is None:
+            return {"wrote": False, "fp_ints": [], "first_write": False}
+        dest_sdata = SprayData.from_tables(
+            spark, dest, join_char=dest_join_char, mode=mode,
+        )
+        sdata = _load_source(spark, source, join_char, mode)
+        have = {int(r.fp_int) for r in sdata.sam.select("fp_int").collect()}
+        unseen = [i for i in ids if i not in have]
+        if unseen:
+            raise ValueError(f"fp_ints not in source sam: {unseen}")
+        _filter_to_fp_ints(sdata, ids)
+        _apply_promotion_plan(
+            sdata, _dest_plan_from_schema(sdata, dest_sdata, prefix=prefix),
+            prefix=prefix,
+        )
+        for name in _DEST_TABLES:
+            setattr(
                 sdata,
-                ks,
-                which=ax,
-                prefix=prefix,
-                dtypes=dict(zip(ax_plan["key"], ax_plan["dtype"])),
+                name,
+                _align_frame_to_dest(getattr(sdata, name), getattr(dest_sdata, name)),
             )
-    return sdata
+        sdata.to_tables(
+            spark,
+            table_base=dest,
+            join_char=dest_join_char,
+            subset=_DEST_TABLES,
+            replace_where=fp_int_predicate(ids),
+        )
+        return {"wrote": True, "fp_ints": ids, "first_write": False}
+
+    sdata = _load_source(spark, source, join_char, mode)
+    if suggested:
+        promote_suggested(
+            sdata,
+            which="both",
+            promote_sam=True,
+            verbose=False,
+            profile_kwargs=profile_kwargs,
+            prefix=prefix,
+        )
+    else:
+        _apply_promotion_plan(sdata, plan, prefix=prefix)
+    sdata.to_tables(
+        spark, table_base=dest, join_char=dest_join_char, subset=_DEST_TABLES,
+    )
+    ids = [int(r.fp_int) for r in sdata.sam.select("fp_int").collect()]
+    return {"wrote": True, "fp_ints": ids, "first_write": True}

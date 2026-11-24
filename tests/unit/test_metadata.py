@@ -1,4 +1,8 @@
 import json
+import os
+import shutil
+from pathlib import Path
+
 import pytest
 import pandas as pd
 import numpy as np
@@ -284,3 +288,363 @@ def test_metadata_promote_suggested(dummy_h5ad_pair, spark_collect):
     # --- guard: keys override not allowed with which='both' ----------------
     with pytest.raises(ValueError):
         cs.md.promote_suggested(sdata, which='both', keys=['cell_type'])
+
+
+def test_promote_applies_dry_run_plan(dummy_h5ad_pair, spark_collect):
+    """promote(sdata, plan=) is the apply step for a dry_run plan."""
+    sdata = SprayData.from_h5ads(
+        spark_collect, path=dummy_h5ad_pair, from_raw=False, mode='delta',
+        obs_metadata_columns='all', var_metadata_columns='all',
+        metadata_variant=False, force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    plan = cs.md.promote_suggested(
+        sdata, which='both', promote_sam=True, dry_run=True, verbose=False,
+        profile_kwargs={'max_categorical': 3},
+    )
+    plan = plan[plan['key'].isin(['cell_type', 'tissue', 'highly_variable'])]
+    cs.md.promote(sdata, plan=plan)
+
+    assert 'cell_type' in sdata.obs.columns
+    assert 'tissue' not in sdata.obs.columns
+    assert 'tissue' in sdata.sam.columns
+    assert 'highly_variable' in sdata.var.columns
+    obs = sdata.obs.select('cell_barcode', 'cell_type').toPandas().set_index('cell_barcode')
+    assert obs.loc['cA0', 'cell_type'] == 'T'
+
+
+def _write_bronze(spark, dummy_h5ad_pair, bronze):
+    sdata = SprayData.from_h5ads(
+        spark, path=dummy_h5ad_pair, from_raw=False, mode='delta',
+        obs_metadata_columns='all', var_metadata_columns='all',
+        metadata_variant=False, force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    sdata.to_tables(spark, table_base=bronze, join_char='/')
+    return sdata
+
+
+def test_md_run_first_load_suggested_and_plan(dummy_h5ad_pair, spark_collect, tmp_path):
+    """First dest write is obs/var/sam only; bronze and X stay put."""
+    spark = spark_collect
+    bronze = str(tmp_path / 'bronze')
+    dest_suggested = str(tmp_path / 'dest_suggested')
+    dest_plan = str(tmp_path / 'dest_plan')
+
+    sdata = _write_bronze(spark, dummy_h5ad_pair, bronze)
+    plan = cs.md.promote_suggested(
+        sdata, which='both', promote_sam=True, dry_run=True, verbose=False,
+        profile_kwargs={'max_categorical': 3},
+    )
+    plan = plan[plan['key'].isin(['cell_type', 'tissue', 'highly_variable'])]
+
+    out = cs.md.run(
+        spark, bronze, dest_suggested, suggested=True,
+        create_if_not_exists=True, join_char='/', mode='delta',
+        profile_kwargs={'max_categorical': 3},
+    )
+    assert out['wrote'] and out['first_write']
+    cs.md.run(
+        spark, bronze, dest_plan, plan=plan,
+        create_if_not_exists=True, join_char='/', mode='delta',
+    )
+
+    bronze_loaded = SprayData.from_tables(
+        spark, bronze, join_char='/', mode='delta',
+    )
+    assert 'cell_type' not in bronze_loaded.obs.columns
+    assert bronze_loaded.X is not None
+
+    for dest in (dest_suggested, dest_plan):
+        loaded = SprayData.from_tables(spark, dest, join_char='/', mode='delta')
+        assert loaded.X is None
+        assert not (Path(dest) / 'X').exists()
+        assert 'cell_type' in loaded.obs.columns
+        assert 'tissue' not in loaded.obs.columns
+        assert 'tissue' in loaded.sam.columns
+        assert 'highly_variable' in loaded.var.columns
+        obs = loaded.obs.select('cell_barcode', 'cell_type').toPandas().set_index(
+            'cell_barcode'
+        )
+        assert obs.loc['cA0', 'cell_type'] == 'T'
+        sam = loaded.sam.select('file_path', 'tissue').toPandas().set_index('file_path')
+        assert sam.loc[dummy_h5ad_pair[0], 'tissue'] == 'lung'
+        assert sam.loc[dummy_h5ad_pair[1], 'tissue'] == 'blood'
+
+
+def test_md_run_guards(spark_collect, tmp_path):
+    bronze = str(tmp_path / 'bronze')
+    dest = str(tmp_path / 'dest')
+    with pytest.raises(ValueError, match='do not exist'):
+        cs.md.run(spark_collect, bronze, dest, join_char='/', mode='delta')
+    with pytest.raises(ValueError, match='dest_join_char'):
+        cs.md.run(
+            spark_collect, bronze, bronze, suggested=True,
+            create_if_not_exists=True, join_char='/', mode='delta',
+        )
+    with pytest.raises(ValueError, match='not both'):
+        cs.md.run(
+            spark_collect, bronze, dest, plan=pd.DataFrame(),
+            suggested=True, create_if_not_exists=True,
+            join_char='/', mode='delta',
+        )
+    with pytest.raises(ValueError, match='suggested=True or plan='):
+        cs.md.run(
+            spark_collect, bronze, dest, create_if_not_exists=True,
+            join_char='/', mode='delta',
+        )
+
+
+def test_md_run_daily_uses_dest_schema(
+    dummy_h5ad_pair, spark_collect, tmp_path,
+):
+    """Later runs fill dest columns, replaceWhere, and do not add keys."""
+    spark = spark_collect
+    bronze = str(tmp_path / 'bronze')
+    dest = str(tmp_path / 'dest')
+    _write_bronze(spark, dummy_h5ad_pair, bronze)
+    cs.md.run(
+        spark, bronze, dest, suggested=True, create_if_not_exists=True,
+        join_char='/', mode='delta', profile_kwargs={'max_categorical': 3},
+    )
+
+    dest_before = SprayData.from_tables(spark, dest, join_char='/', mode='delta')
+    dest_obs_cols = list(dest_before.obs.columns)
+    dest_sam_cols = list(dest_before.sam.columns)
+    by_fp = {r.fp_int: r.file_path for r in dest_before.sam.collect()}
+    replace_id, keep_id = sorted(by_fp)[0], sorted(by_fp)[1]
+    keep_obs_n = dest_before.obs.filter(
+        dest_before.obs.fp_int == keep_id
+    ).count()
+    keep_types = {
+        r.cell_type
+        for r in dest_before.obs.filter(dest_before.obs.fp_int == keep_id)
+        .select('cell_type').collect()
+    }
+    keep_tissue = dest_before.sam.filter(
+        dest_before.sam.fp_int == keep_id
+    ).collect()[0].tissue
+
+    bronze_s = SprayData.from_tables(spark, bronze, join_char='/', mode='delta')
+    pdf = bronze_s.obs.toPandas()
+
+    def _tweak(row):
+        payload = json.loads(row.obs_data)
+        if int(row.fp_int) == int(replace_id) and payload.get('cell_type') == 'T':
+            payload['cell_type'] = 'NK'
+        return json.dumps(payload)
+
+    pdf['obs_data'] = pdf.apply(_tweak, axis=1)
+    bronze_s.obs = spark.createDataFrame(pdf)
+    bronze_s.to_tables(spark, table_base=bronze, join_char='/', subset=['obs'])
+
+    skipped = cs.md.run(
+        spark, bronze, dest, suggested=True, create_if_not_exists=True,
+        join_char='/', mode='delta',
+    )
+    assert skipped == {'wrote': False, 'fp_ints': [], 'first_write': False}
+
+    cs.md.run(
+        spark, bronze, dest, suggested=True, create_if_not_exists=True,
+        fp_ints=replace_id, join_char='/', mode='delta',
+    )
+
+    loaded = SprayData.from_tables(spark, dest, join_char='/', mode='delta')
+    assert loaded.X is None
+    assert list(loaded.obs.columns) == dest_obs_cols
+    assert list(loaded.sam.columns) == dest_sam_cols
+    assert 'batch' not in loaded.obs.columns
+
+    replaced = {
+        r.cell_type
+        for r in loaded.obs.filter(loaded.obs.fp_int == replace_id)
+        .select('cell_type').collect()
+    }
+    assert 'NK' in replaced
+    kept = {
+        r.cell_type
+        for r in loaded.obs.filter(loaded.obs.fp_int == keep_id)
+        .select('cell_type').collect()
+    }
+    assert kept == keep_types
+    assert 'NK' not in kept
+    assert loaded.obs.filter(loaded.obs.fp_int == keep_id).count() == keep_obs_n
+    assert loaded.sam.filter(
+        loaded.sam.fp_int == keep_id
+    ).collect()[0].tissue == keep_tissue
+
+    with pytest.raises(ValueError, match='not bool'):
+        cs.md.run(
+            spark, bronze, dest, fp_ints=True, join_char='/', mode='delta',
+        )
+
+
+def test_md_run_recreate_after_dest_dropped(dummy_h5ad_pair, spark_collect, tmp_path):
+    spark = spark_collect
+    bronze = str(tmp_path / 'bronze')
+    dest = str(tmp_path / 'dest')
+    _write_bronze(spark, dummy_h5ad_pair, bronze)
+    cs.md.run(
+        spark, bronze, dest, suggested=True, create_if_not_exists=True,
+        join_char='/', mode='delta', profile_kwargs={'max_categorical': 3},
+    )
+    shutil.rmtree(dest)
+    out = cs.md.run(
+        spark, bronze, dest, suggested=True, create_if_not_exists=True,
+        join_char='/', mode='delta', profile_kwargs={'max_categorical': 3},
+    )
+    assert out['first_write'] and out['wrote']
+    loaded = SprayData.from_tables(spark, dest, join_char='/', mode='delta')
+    assert 'cell_type' in loaded.obs.columns
+    assert 'tissue' in loaded.sam.columns
+
+
+def test_md_run_daily_sanitised_keys(spark_collect, tmp_path):
+    """Daily dest fill looks up orig.ident in JSON, not dest column orig_ident."""
+    import anndata as ad
+    from scipy.sparse import csr_matrix
+
+    spark = spark_collect
+    adata = ad.AnnData(
+        X=csr_matrix(np.arange(8, dtype="float32").reshape(2, 4)),
+        obs=pd.DataFrame({
+            "orig.ident": ["s1", "s1"],
+            "cell.type": pd.Categorical(["T", "B"]),
+        }, index=["c0", "c1"]),
+        var=pd.DataFrame({
+            "gene.biotype": ["protein_coding"] * 4,
+        }, index=["g0", "g1", "g2", "g3"]),
+    )
+    path = str(tmp_path / "dots.h5ad")
+    adata.write(path)
+    bronze = str(tmp_path / "bronze")
+    dest = str(tmp_path / "dest")
+    sdata = SprayData.from_h5ads(
+        spark, path=[path], from_raw=False, mode="delta",
+        obs_metadata_columns="all", var_metadata_columns="all",
+        metadata_variant=False, force_partitioning=1,
+    )
+    sdata.set_intermediary_persistance(False)
+    sdata.to_tables(spark, table_base=bronze, join_char="/")
+    cs.md.run(
+        spark, bronze, dest, suggested=True, create_if_not_exists=True,
+        join_char="/", mode="delta", profile_kwargs={"max_categorical": 3},
+    )
+    fp = sdata.sam.collect()[0].fp_int
+    bronze_s = SprayData.from_tables(spark, bronze, join_char="/", mode="delta")
+    pdf = bronze_s.obs.toPandas()
+
+    def _tweak(row):
+        payload = json.loads(row.obs_data)
+        if payload.get("orig.ident") == "s1":
+            payload["orig.ident"] = "s2"
+        if payload.get("cell.type") == "T":
+            payload["cell.type"] = "NK"
+        return json.dumps(payload)
+
+    pdf["obs_data"] = pdf.apply(_tweak, axis=1)
+    bronze_s.obs = spark.createDataFrame(pdf)
+    bronze_s.to_tables(spark, table_base=bronze, join_char="/", subset=["obs"])
+
+    cs.md.run(spark, bronze, dest, fp_ints=fp, join_char="/", mode="delta")
+    loaded = SprayData.from_tables(spark, dest, join_char="/", mode="delta")
+    assert loaded.sam.select("orig_ident").toPandas()["orig_ident"].iloc[0] == "s2"
+    obs = loaded.obs.select("cell_barcode", "cell_type").toPandas().set_index(
+        "cell_barcode"
+    )
+    assert obs.loc["c0", "cell_type"] == "NK"
+
+
+def test_md_run_new_file_keeps_first_dest_schema(
+    dummy_h5ad_pair, spark_collect, tmp_path,
+):
+    """Ingest A → dest, then ingest B: dest columns stay; B fills them; B-only keys do not appear."""
+    spark = spark_collect
+    h5dir = tmp_path / 'h5ads'
+    h5dir.mkdir()
+    a, b = dummy_h5ad_pair
+    os.symlink(a, h5dir / 'a.h5ad')
+    bronze = str(tmp_path / 'bronze')
+    dest = str(tmp_path / 'dest')
+    ingest_kw = dict(
+        spark=spark, path=str(h5dir),
+        table_base=bronze, join_char='/', mode='delta',
+        from_raw=False, force_partitioning=2,
+        create_if_not_exists=True,
+        obs_metadata_columns='all', var_metadata_columns='all',
+        metadata_variant=False,
+    )
+
+    r1 = cs.ingest.run(**ingest_kw)
+    assert r1['wrote'] and r1['n_new'] == 1
+    cs.md.run(
+        spark, bronze, dest, create_if_not_exists=True, suggested=True,
+        fp_ints=r1.get('fp_ints'), join_char='/', mode='delta',
+        profile_kwargs={'max_categorical': 3},
+    )
+    dest1 = SprayData.from_tables(spark, dest, join_char='/', mode='delta')
+    obs_cols = list(dest1.obs.columns)
+    sam_cols = list(dest1.sam.columns)
+    var_cols = list(dest1.var.columns)
+    assert set(dest1.obs.select('cell_barcode').toPandas()['cell_barcode']) == {
+        'cA0', 'cA1', 'cA2',
+    }
+    assert 'cell_type' in obs_cols
+    assert 'batch' not in obs_cols
+    assert 'tissue' in sam_cols
+
+    os.symlink(b, h5dir / 'b.h5ad')
+    r2 = cs.ingest.run(**ingest_kw)
+    assert r2['wrote'] and r2['n_new'] == 1
+    cs.md.run(
+        spark, bronze, dest, create_if_not_exists=True, suggested=True,
+        fp_ints=r2['fp_ints'], join_char='/', mode='delta',
+    )
+
+    dest2 = SprayData.from_tables(spark, dest, join_char='/', mode='delta')
+    assert list(dest2.obs.columns) == obs_cols
+    assert list(dest2.sam.columns) == sam_cols
+    assert list(dest2.var.columns) == var_cols
+    assert 'batch' not in dest2.obs.columns
+    barcodes = set(dest2.obs.select('cell_barcode').toPandas()['cell_barcode'])
+    assert barcodes == {'cA0', 'cA1', 'cA2', 'cB0', 'cB1', 'cB2'}
+    obs = dest2.obs.select('cell_barcode', 'cell_type').toPandas().set_index(
+        'cell_barcode'
+    )
+    assert obs.loc['cA0', 'cell_type'] == 'T'
+    assert obs.loc['cB2', 'cell_type'] == 'B'
+    tissues = set(dest2.sam.select('tissue').toPandas()['tissue'])
+    assert tissues == {'lung', 'blood'}
+
+
+def test_md_run_same_base_dest_join_char(dummy_h5ad_pair, spark_collect, tmp_path):
+    """One prefix, two joiners: ingest .bronze_ tables, dest .md_ tables."""
+    spark = spark_collect
+    base = str(tmp_path / 'sc')
+    sdata = SprayData.from_h5ads(
+        spark, path=dummy_h5ad_pair, from_raw=False, mode='delta',
+        obs_metadata_columns='all', var_metadata_columns='all',
+        metadata_variant=False, force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    sdata.to_tables(spark, table_base=base, join_char='.bronze_')
+
+    cs.md.run(
+        spark, base, base, suggested=True, create_if_not_exists=True,
+        join_char='.bronze_', dest_join_char='.md_', mode='delta',
+        profile_kwargs={'max_categorical': 3},
+    )
+
+    bronze = SprayData.from_tables(
+        spark, base, join_char='.bronze_', mode='delta',
+    )
+    dest = SprayData.from_tables(spark, base, join_char='.md_', mode='delta')
+    assert bronze.X is not None
+    assert 'cell_type' not in bronze.obs.columns
+    assert dest.X is None
+    assert 'cell_type' in dest.obs.columns
+    assert 'tissue' in dest.sam.columns
+    assert Path(base + '.bronze_X').exists()
+    assert Path(base + '.md_obs').exists()
+    assert not Path(base + '.md_X').exists()
+
