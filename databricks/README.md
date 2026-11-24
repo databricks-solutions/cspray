@@ -62,18 +62,22 @@ your data and compute.
 The common case is a directory of files that have already been processed
 elsewhere — published atlases, or data a collaborator has already filtered and
 normalised — where the goal is a queryable set of tables that stay up to date.
-Use `cspray.ingest.run` for that (same call every day). Keep
-`create_if_not_exists=True` on the job: first run creates the tables, later
-runs are incremental. Then load and sort out the metadata:
+Use `cspray.ingest.run` for bronze, then `cs.md.run` for dest `obs` /
+`var` / `sam`. Same calls every day. Keep `create_if_not_exists=True` on
+both: first run creates the tables, later runs are incremental. Dest is a
+different prefix than bronze so skinny ingest (including `X`) stays put.
 
 ```
 import cspray as cs
 
-cs.ingest.run(
+bronze = f'{CATALOG}.{SCHEMA}.bronze'
+dest = f'{CATALOG}.{SCHEMA}.silver'
+
+stats = cs.ingest.run(
     spark,
     path=path,
-    table_base=f'{CATALOG}.{SCHEMA}',
-    join_char='.bronze_',
+    table_base=bronze,
+    join_char='.',
     from_raw=False,
     force_partitioning=500,
     chunk_size=int(6_000_000),
@@ -82,31 +86,24 @@ cs.ingest.run(
     create_if_not_exists=True,  # first load if empty; same call every day after
 )
 
-sdata = SprayData.from_tables(
-    spark, table_base=f'{CATALOG}.{SCHEMA}', join_char='.bronze_',
-)
-sdata.set_intermediary_persistance(persist=False)
-
-# typed columns for the keys worth filtering on, with keys that are constant
-# within a file collected onto the sample table instead of every cell
-cs.md.promote_suggested(sdata, which='both', promote_sam=True)
-
-# promotion only rewrites metadata, so X does not need writing a second time
-# here we overwrite the tables with metadata, we could choose to construct new ones instead
-sdata.to_tables_and_reset(
+cs.md.run(
     spark,
-    table_base=f'{CATALOG}.{SCHEMA}',
-    join_char='.bronze_',
-    subset=['obs', 'var', 'sam'],
+    bronze,
+    dest,
+    create_if_not_exists=True,
+    suggested=True,              # first dest only; ignored once dest exists
+    fp_ints=stats.get('fp_ints'),
 )
 ```
 
 Published files rarely agree on their obs columns, which is what the metadata
 payload plus promotion is for: `cs.md.profile` reports what is actually in the
-files, and `promote_suggested` materialises the useful keys as typed columns.
-`promote_sam=True` routes sample-level values such as tissue, assay or disease to
-`sam` (one row per input file) rather than repeating them on every cell, so the
-sample table becomes the natural place to browse and filter what has been
-ingested. Sample annotations you hold outside the files can be joined on with
+files, and the first `cs.md.run(..., suggested=True)` materialises the useful
+keys as typed dest columns. Sample-constant values such as tissue, assay or
+disease go to dest `sam` (one row per input file) rather than repeating them
+on every cell. Later runs fill those dest columns for the files ingest just
+wrote. To change dest names, drop dest `obs` / `var` / `sam` (bronze stays)
+and let the next run recreate them, or pass `plan=` on that first load.
+Sample annotations you hold outside the files can be joined on with
 `cs.md.add_sample_metadata(sdata, metadata_df, on='file_path')`.
 
