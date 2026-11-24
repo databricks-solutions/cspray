@@ -62,16 +62,16 @@ your data and compute.
 The common case is a directory of files that have already been processed
 elsewhere — published atlases, or data a collaborator has already filtered and
 normalised — where the goal is a queryable set of tables that stay up to date.
-Use `cspray.ingest.run` for bronze, then `cs.md.run` for dest `obs` /
-`var` / `sam`. Same calls every day. Keep `create_if_not_exists=True` on
-both: first run creates the tables, later runs are incremental. Dest is a
-different prefix than bronze so skinny ingest (including `X`) stays put.
+Ingest the files, then add filterable metadata columns. Use two table names
+so the counts from ingest and the metadata stay separate. Same calls every
+day. Keep `create_if_not_exists=True` on both: first run creates the tables,
+later runs are incremental.
 
 ```
 import cspray as cs
 
 bronze = f'{CATALOG}.{SCHEMA}.bronze'
-dest = f'{CATALOG}.{SCHEMA}.silver'
+dest = f'{CATALOG}.{SCHEMA}.md'
 
 stats = cs.ingest.run(
     spark,
@@ -91,19 +91,19 @@ cs.md.run(
     bronze,
     dest,
     create_if_not_exists=True,
-    suggested=True,              # first dest only; ignored once dest exists
+    suggested=True,              # pick columns the first time; reused after
     fp_ints=stats.get('fp_ints'),
 )
 ```
 
-Published files rarely agree on their obs columns, which is what the metadata
-payload plus promotion is for: `cs.md.profile` reports what is actually in the
-files, and the first `cs.md.run(..., suggested=True)` materialises the useful
-keys as typed dest columns. Sample-constant values such as tissue, assay or
-disease go to dest `sam` (one row per input file) rather than repeating them
-on every cell. Later runs fill those dest columns for the files ingest just
-wrote. To change dest names, drop dest `obs` / `var` / `sam` (bronze stays)
-and let the next run recreate them, or pass `plan=` on that first load.
-Sample annotations you hold outside the files can be joined on with
+Published files rarely agree on their obs columns. The first
+`cs.md.run(..., suggested=True)` turns the useful ones into real columns
+(`cs.md.profile` is how you inspect what the files actually contain). Values
+that are the same for every cell in a file (tissue, assay, disease) go on
+the sample table, one row per file. Later runs fill those columns for the
+files ingest just wrote. To choose different columns, drop the metadata
+tables (the ingested files stay) and let the next run recreate them, or
+pass `plan=` on that first load. Sample annotations you hold outside the
+files can be joined on with
 `cs.md.add_sample_metadata(sdata, metadata_df, on='file_path')`.
 
