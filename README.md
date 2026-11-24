@@ -89,10 +89,13 @@ files into structured columns on new tables for obs, var and sam.
 ```
 import cspray as cs
 
+base = 'singlecell'              # on Databricks: f'{CATALOG}.{SCHEMA}'
+
 stats = cs.ingest.run(
     spark,
     path='/data/h5ads',          # directory, one file, or a list of paths
-    table_base='singlecell.bronze',
+    table_base=base,
+    join_char='.bronze_',        # tables: singlecell.bronze_X, _obs, …
     from_raw=False,              # files are already processed
     obs_metadata_columns='all',
     var_metadata_columns='all',
@@ -101,8 +104,10 @@ stats = cs.ingest.run(
 
 cs.md.run(
     spark,
-    'singlecell.bronze',
-    'singlecell.silver',             # metadata tables; keep separate from ingest
+    source=base,                 # read the ingest tables
+    dest=base,                   # write metadata tables in the same place
+    join_char='.bronze_',        # …bronze_X, bronze_obs, …
+    dest_join_char='.md_',       # …md_obs, md_var, md_sam
     create_if_not_exists=True,
     suggested=True,              # pick columns the first time; reused after
     fp_ints=stats.get('fp_ints'),
@@ -112,8 +117,8 @@ cs.md.run(
 The first `md.run` with `suggested=True` chooses the columns (or pass
 `plan=` if you want to choose them yourself). After that, new files get the
 same columns. If ingest did not write anything, `md.run` does nothing. To
-pick different columns, drop the metadata tables (`singlecell.md` here) and
-run again — you do not need to re-ingest.
+pick different columns, drop the metadata tables (`singlecell.md_obs` and
+the matching `_var` / `_sam`) and run again — you do not need to re-ingest.
 
 Do not follow this with `from_h5ads` + overwrite — that would rebuild every
 table from scratch, which is the other example.

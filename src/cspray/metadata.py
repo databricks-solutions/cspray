@@ -40,12 +40,17 @@ Promotion offers three in-memory paths depending on how much control you want:
 3. Full manual -> use ``profile`` + ``promote`` directly with your own key list
    and ``dtypes``.
 
-``run`` is the lake job, parallel to ``ingest.run``. Dest missing and
-``create_if_not_exists=True`` builds dest from ``suggested=True`` or ``plan=``.
-Dest already there: those flags are ignored and dest's current columns are
-filled for ``fp_ints`` (or a no-op if ingest wrote nothing). Drop dest
-``obs`` / ``var`` / ``sam`` for a full metadata refresh; bronze, including
-``X``, stays. You do not reingest.
+``run`` is the lake job, parallel to ``ingest.run``. Tables are named
+``table_base + join_char + slot``, same as ingest. ``join_char`` is how
+source (ingest) tables were named; ``dest_join_char`` is how dest
+``obs`` / ``var`` / ``sam`` are named (defaults to ``join_char``). Source
+and dest prefixes may be the same string when the joiners differ.
+Dest missing and ``create_if_not_exists=True`` builds dest from
+``suggested=True`` or ``plan=``. Dest already there: those flags are
+ignored and dest's current columns are filled for ``fp_ints`` (or a
+no-op if ingest wrote nothing). Drop dest ``obs`` / ``var`` / ``sam``
+for a full metadata refresh; bronze, including ``X``, stays. You do
+not reingest.
 
 Dest column names are whatever ``_safe_column_name`` / ``_unique_column_name``
 produced when dest was written (``orig.ident`` becomes ``orig_ident``, and so
@@ -1109,6 +1114,23 @@ def _load_source(spark, source, join_char, mode):
     return sdata
 
 
+def _assert_dest_distinct(source, dest, join_char, dest_join_char):
+    """Reject dest names that would overwrite ingest obs/var/sam."""
+    overlap = [
+        name for name in _DEST_TABLES
+        if _table_name(source, join_char, name)
+        == _table_name(dest, dest_join_char, name)
+    ]
+    if overlap:
+        names = ", ".join(
+            _table_name(source, join_char, name) for name in overlap
+        )
+        raise ValueError(
+            f"dest tables would overwrite source ({names}). "
+            "Pass dest_join_char= so metadata tables are not the ingest tables."
+        )
+
+
 def _resolve_dest(spark, dest, join_char, mode, create_if_not_exists):
     """Whether dest obs/var/sam already exist (ingest-style first vs later)."""
     present = [
@@ -1382,6 +1404,7 @@ def run(
     fp_ints: Optional[Union[int, List[int]]] = None,
     create_if_not_exists: bool = False,
     join_char: str = ".",
+    dest_join_char: Optional[str] = None,
     mode: Optional[str] = None,
     profile_kwargs: Optional[dict] = None,
     prefix: str = "",
@@ -1389,12 +1412,17 @@ def run(
     """Promote bronze payloads onto dest ``obs`` / ``var`` / ``sam``.
 
     Same call every day, like :func:`cspray.ingest.run`. Bronze, including
-    ``X``, is never rewritten.
+    ``X``, is never rewritten. Table names are ``table_base + join_char +
+    slot``, same as ingest. ``join_char`` finds the source tables;
+    ``dest_join_char`` names dest (default: ``join_char``). Prefixes may
+    be the same when the joiners differ.
 
-        stats = cs.ingest.run(spark, path, table_base=bronze,
-                              create_if_not_exists=True, ...)
-        cs.md.run(spark, bronze, dest, create_if_not_exists=True,
-                  suggested=True, fp_ints=stats.get('fp_ints'))
+        base = f'{catalog}.{schema}'
+        stats = cs.ingest.run(spark, path, table_base=base,
+                              join_char='.bronze_', create_if_not_exists=True, ...)
+        cs.md.run(spark, base, base, join_char='.bronze_', dest_join_char='.md_',
+                  create_if_not_exists=True, suggested=True,
+                  fp_ints=stats.get('fp_ints'))
 
     * Dest missing and ``create_if_not_exists=True``: first load. Uses
       ``suggested=True`` or ``plan=`` (leave ``suggested=True`` on the job;
@@ -1415,7 +1443,8 @@ def run(
     ----------
     spark : SparkSession
     source, dest : str
-        Table prefixes. Dest must differ from source.
+        Table prefixes (``table_base`` in ingest / ``to_tables``). May be
+        the same string when ``dest_join_char`` differs from ``join_char``.
     plan : pandas.DataFrame, optional
         First-load schema (``which, key, dtype``). Ignored when dest exists.
         Do not pass with ``suggested=True`` on a first load.
@@ -1433,7 +1462,10 @@ def run(
         If dest already exists, the flag is ignored. Default False: missing
         dest is an error.
     join_char : str
-        Join character for table names. Defaults to ``'.'``.
+        Joiner for **source** table names (same as ingest). Defaults to ``'.'``.
+    dest_join_char : str, optional
+        Joiner for dest ``obs`` / ``var`` / ``sam``. Defaults to ``join_char``.
+        Pass this when source and dest share a prefix (one schema, two stages).
     mode : str, optional
         ``databricks`` or ``delta``. Default databricks.
     profile_kwargs : dict, optional
@@ -1441,7 +1473,7 @@ def run(
         ``suggested=True``.
     prefix : str
         Prefix used when dest was (or will be) built. Daily matching uses
-        the same prefix.
+        the same prefix. Column names, not table names.
 
     Returns
     -------
@@ -1452,10 +1484,11 @@ def run(
         mode = "databricks"
     if not isinstance(source, str) or not isinstance(dest, str):
         raise TypeError("source and dest must be table-prefix strings")
-    if source == dest:
-        raise ValueError("dest must differ from source so bronze stays unchanged")
+    if dest_join_char is None:
+        dest_join_char = join_char
+    _assert_dest_distinct(source, dest, join_char, dest_join_char)
 
-    first_write = _resolve_dest(spark, dest, join_char, mode, create_if_not_exists)
+    first_write = _resolve_dest(spark, dest, dest_join_char, mode, create_if_not_exists)
     if first_write and suggested and plan is not None:
         raise ValueError("pass plan= or suggested=True, not both")
     if first_write and not suggested and plan is None:
@@ -1469,7 +1502,7 @@ def run(
         if ids is None:
             return {"wrote": False, "fp_ints": [], "first_write": False}
         dest_sdata = SprayData.from_tables(
-            spark, dest, join_char=join_char, mode=mode,
+            spark, dest, join_char=dest_join_char, mode=mode,
         )
         sdata = _load_source(spark, source, join_char, mode)
         have = {int(r.fp_int) for r in sdata.sam.select("fp_int").collect()}
@@ -1490,7 +1523,7 @@ def run(
         sdata.to_tables(
             spark,
             table_base=dest,
-            join_char=join_char,
+            join_char=dest_join_char,
             subset=_DEST_TABLES,
             replace_where=fp_int_predicate(ids),
         )
@@ -1509,7 +1542,7 @@ def run(
     else:
         _apply_promotion_plan(sdata, plan, prefix=prefix)
     sdata.to_tables(
-        spark, table_base=dest, join_char=join_char, subset=_DEST_TABLES,
+        spark, table_base=dest, join_char=dest_join_char, subset=_DEST_TABLES,
     )
     ids = [int(r.fp_int) for r in sdata.sam.select("fp_int").collect()]
     return {"wrote": True, "fp_ints": ids, "first_write": True}

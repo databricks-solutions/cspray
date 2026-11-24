@@ -62,22 +62,22 @@ your data and compute.
 The common case is a directory of files that have already been processed
 elsewhere — published atlases, or data a collaborator has already filtered and
 normalised — where the goal is a queryable set of tables that stay up to date.
-Ingest the files, then add filterable metadata columns. Use two table names
-so the counts from ingest and the metadata stay separate. Same calls every
-day. Keep `create_if_not_exists=True` on both: first run creates the tables,
-later runs are incremental.
+Ingest the files, then add filterable metadata columns. Same catalog and
+schema as ingest; `join_char` / `dest_join_char` set the table names
+(`.bronze_X` vs `.md_obs`). Same calls every day. Keep
+`create_if_not_exists=True` on both: first run creates the tables, later
+runs are incremental.
 
 ```
 import cspray as cs
 
-bronze = f'{CATALOG}.{SCHEMA}.bronze'
-dest = f'{CATALOG}.{SCHEMA}.md'
+base = f'{CATALOG}.{SCHEMA}'
 
 stats = cs.ingest.run(
     spark,
     path=path,
-    table_base=bronze,
-    join_char='.',
+    table_base=base,
+    join_char='.bronze_',
     from_raw=False,
     force_partitioning=500,
     chunk_size=int(6_000_000),
@@ -88,8 +88,10 @@ stats = cs.ingest.run(
 
 cs.md.run(
     spark,
-    bronze,
-    dest,
+    source=base,                 # read the ingest tables
+    dest=base,                   # write metadata tables in the same place
+    join_char='.bronze_',        # …bronze_X, bronze_obs, …
+    dest_join_char='.md_',       # …md_obs, md_var, md_sam
     create_if_not_exists=True,
     suggested=True,              # pick columns the first time; reused after
     fp_ints=stats.get('fp_ints'),

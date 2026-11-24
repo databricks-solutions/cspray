@@ -377,7 +377,7 @@ def test_md_run_guards(spark_collect, tmp_path):
     dest = str(tmp_path / 'dest')
     with pytest.raises(ValueError, match='do not exist'):
         cs.md.run(spark_collect, bronze, dest, join_char='/', mode='delta')
-    with pytest.raises(ValueError, match='differ'):
+    with pytest.raises(ValueError, match='dest_join_char'):
         cs.md.run(
             spark_collect, bronze, bronze, suggested=True,
             create_if_not_exists=True, join_char='/', mode='delta',
@@ -615,4 +615,36 @@ def test_md_run_new_file_keeps_first_dest_schema(
     assert obs.loc['cB2', 'cell_type'] == 'B'
     tissues = set(dest2.sam.select('tissue').toPandas()['tissue'])
     assert tissues == {'lung', 'blood'}
+
+
+def test_md_run_same_base_dest_join_char(dummy_h5ad_pair, spark_collect, tmp_path):
+    """One prefix, two joiners: ingest .bronze_ tables, dest .md_ tables."""
+    spark = spark_collect
+    base = str(tmp_path / 'sc')
+    sdata = SprayData.from_h5ads(
+        spark, path=dummy_h5ad_pair, from_raw=False, mode='delta',
+        obs_metadata_columns='all', var_metadata_columns='all',
+        metadata_variant=False, force_partitioning=2,
+    )
+    sdata.set_intermediary_persistance(False)
+    sdata.to_tables(spark, table_base=base, join_char='.bronze_')
+
+    cs.md.run(
+        spark, base, base, suggested=True, create_if_not_exists=True,
+        join_char='.bronze_', dest_join_char='.md_', mode='delta',
+        profile_kwargs={'max_categorical': 3},
+    )
+
+    bronze = SprayData.from_tables(
+        spark, base, join_char='.bronze_', mode='delta',
+    )
+    dest = SprayData.from_tables(spark, base, join_char='.md_', mode='delta')
+    assert bronze.X is not None
+    assert 'cell_type' not in bronze.obs.columns
+    assert dest.X is None
+    assert 'cell_type' in dest.obs.columns
+    assert 'tissue' in dest.sam.columns
+    assert Path(base + '.bronze_X').exists()
+    assert Path(base + '.md_obs').exists()
+    assert not Path(base + '.md_X').exists()
 
